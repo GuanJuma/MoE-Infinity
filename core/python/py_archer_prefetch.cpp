@@ -183,6 +183,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "batchgen_expert_ffn",
       [](torch::Tensor x, torch::Tensor gate, torch::Tensor up,
          torch::Tensor down) {
+        TORCH_CHECK(x.is_cuda(), "batchgen_expert_ffn expects CUDA tensors");
         auto output = torch::empty({x.size(0), down.size(0)}, x.options());
         auto gate_up = torch::empty({x.size(0), 2 * gate.size(0)}, x.options());
         auto act = torch::empty({x.size(0), gate.size(0)}, x.options());
@@ -200,6 +201,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "default_expert_ffn",
       [](torch::Tensor x, torch::Tensor gate, torch::Tensor up,
          torch::Tensor down) {
+        TORCH_CHECK(x.is_cuda(), "default_expert_ffn expects CUDA tensors");
         auto output = torch::empty({x.size(0), down.size(0)}, x.options());
         auto gate_buf = torch::empty({x.size(0), gate.size(0)}, x.options());
         auto fused_buf = torch::empty({x.size(0), gate.size(0)}, x.options());

@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 
@@ -153,10 +154,10 @@ def test_expert_ffn_rejects_bad_shapes(bg):
         expert_ffn.expert_ffn(x[:0], gate, up, down)
 
 
-def test_aot_param_tables_match_kernel_signatures(bg):
+def test_aot_param_tables_match_kernel_signatures():
     """The native launcher packs parameters in GEMM_PARAMS/SILU_PARAMS order."""
     aot = importlib.import_module(f"{_PKG}.aot")
-    _, vendor = bg
+    vendor = aot.load_vendor_module()
     for variant in aot.all_variants():
         fn = getattr(vendor, variant.kernel)
         params, _ = aot._params_for(variant)
@@ -164,9 +165,9 @@ def test_aot_param_tables_match_kernel_signatures(bg):
         assert runtime_args == [name for name, _ in params], variant.name
 
 
-def test_aot_variants_follow_batchgen_configs(bg):
+def test_aot_variants_follow_batchgen_configs():
     aot = importlib.import_module(f"{_PKG}.aot")
-    _, vendor = bg
+    vendor = aot.load_vendor_module()
     gemms = {v.name: v for v in aot.gemm_variants()}
     assert set(gemms) == {
         "gemm_small_evenk",
@@ -203,6 +204,72 @@ def test_aot_header_embeds_cubins(tmp_path):
     for variant in aot.all_variants():
         for arch in (80, 90):
             assert f'{{"{variant.name}", {arch}, ' in text
+
+
+_DUMP_CUBINS = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import aot
+for v in aot.all_variants():
+    cc = aot.compile_variant(v, 80)
+    open(f"{sys.argv[2]}/{v.name}.cubin", "wb").write(cc.asm["cubin"])
+    print(v.name, aot.scratch_arg_count(cc.metadata))
+"""
+
+
+def test_cubin_param_abi_matches_native_launcher(tmp_path):
+    """Parameter sizes in the cubins == what batchgen_moe.cpp passes.
+
+    The launcher packs ``GEMM_PARAMS`` / ``SILU_PARAMS`` (pointers as
+    CUdeviceptr, i32 as int, i64 as int64_t) followed by the scratch pointers.
+    """
+    triton = pytest.importorskip("triton")
+    aot = importlib.import_module(f"{_PKG}.aot")
+    cuobjdump = os.path.join(
+        os.path.dirname(triton.__file__), "backends/nvidia/bin/cuobjdump"
+    )
+    if not os.path.exists(cuobjdump):
+        pytest.skip("Triton does not ship cuobjdump")
+    env = {k: v for k, v in os.environ.items() if k != "TRITON_INTERPRET"}
+    dump = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _DUMP_CUBINS,
+            os.path.dirname(aot.__file__),
+            str(tmp_path),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if dump.returncode != 0:  # pragma: no cover - toolchain specific
+        pytest.skip(f"Triton AOT unavailable: {dump.stderr[-500:]}")
+    scratch = {
+        line.split()[0]: int(line.split()[1])
+        for line in dump.stdout.splitlines()
+    }
+    size_of = {"i32": 4, "i64": 8}
+
+    for variant in aot.all_variants():
+        elf = subprocess.run(
+            [cuobjdump, "-elf", str(tmp_path / f"{variant.name}.cubin")],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        params = {
+            int(o, 16): int(s, 16)
+            for o, s in re.findall(
+                r"Ordinal\s*:\s*(0x[0-9a-f]+)\s+Offset\s*:\s*0x[0-9a-f]+"
+                r"\s+Size\s*:\s*(0x[0-9a-f]+)",
+                elf,
+            )
+        }
+        declared, _ = aot._params_for(variant)
+        expected = [8 if t.startswith("*") else size_of[t] for _, t in declared]
+        expected += [8] * scratch[variant.name]
+        assert [params[i] for i in sorted(params)] == expected, variant.name
 
 
 def test_archer_config_expert_kernel_validation():
