@@ -70,7 +70,9 @@ exec stream. Python is not involved at runtime.
 
 `MOE_BUILD_BATCHGEN` controls the build step. When unset, the cubins are
 built if Triton can compile them. `"1"` makes a failure fatal, and `"0"`
-skips the step. CMake builds use the `MOE_BUILD_BATCHGEN` option.
+skips the step. CMake builds use the `MOE_BUILD_BATCHGEN` option, and
+`MOE_BATCHGEN_ARCHS` (default `80;90`) sets the cubin arches. Torch's CMake
+config resets `CMAKE_CUDA_ARCHITECTURES`, so that variable is not used.
 
 ## Fallback rules
 

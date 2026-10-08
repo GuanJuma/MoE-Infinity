@@ -67,7 +67,7 @@ For `CUDA_VISIBLE_DEVICES` ordering, expert ownership, and one-host multi-GPU be
 | `NVTX_DISABLE` | `"0"` | `setup.py` build | If `"1"`, compile out NVTX instrumentation macros. | Build-time only. |
 | `MOE_ENABLE_SM90` | `"1"` | `setup.py` build | Include sm_90 kernels in the compiled extensions. | Build-time only. |
 | `MOE_ENABLE_SM120` | `"0"` | `setup.py` build | Include sm_120 kernels and the native FP4 extension arch flags. | Build-time only. |
-| `MOE_BUILD_BATCHGEN` | unset (auto) | `setup.py` build | Embed AOT-compiled BatchGen expert-FFN cubins into `_store` for the enabled SM archs. Unset builds them when Triton can compile, `"1"` makes a failure fatal, `"0"` skips them. | Build-time only. CMake uses the `MOE_BUILD_BATCHGEN` option instead. |
+| `MOE_BUILD_BATCHGEN` | unset (auto) | `setup.py` build | Embed AOT-compiled BatchGen expert-FFN cubins into `_store` for the enabled SM archs. Unset builds them when Triton can compile, `"1"` makes a failure fatal, `"0"` skips them. | Build-time only. CMake uses the `MOE_BUILD_BATCHGEN` option and the `MOE_BATCHGEN_ARCHS` cache variable instead. |
 
 The package version is not set via an environment variable; it is derived from
 git tags at build time by setuptools-scm (see `pyproject.toml`).
