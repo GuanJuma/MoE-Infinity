@@ -187,8 +187,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         auto gate_up = torch::empty({x.size(0), 2 * gate.size(0)}, x.options());
         auto act = torch::empty({x.size(0), gate.size(0)}, x.options());
         auto stream = at::cuda::getCurrentCUDAStream(x.get_device()).stream();
-        TORCH_CHECK(batchgen::ExpertFFN(x, gate, up, down, gate_up, act,
-                                        output, stream),
+        TORCH_CHECK(batchgen::ExpertFFN(x, gate, up, down, gate_up, act, output,
+                                        stream),
                     "BatchGen expert kernel unavailable: ",
                     batchgen::GetStats().last_fallback_reason);
         return output;

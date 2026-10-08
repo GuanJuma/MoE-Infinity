@@ -136,20 +136,22 @@ std::string LoadKernel(const CubinEntry& entry, CUdevice device,
   result = cuModuleGetFunction(&kernel->fn, module, entry.function);
   if (result != CUDA_SUCCESS) return DriverError("cuModuleGetFunction", result);
   if (entry.shared_bytes > 49152) {
-    int optin = 0;
+    int shared_optin_bytes = 0;
     int static_bytes = 0;
-    cuDeviceGetAttribute(
-        &optin, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device);
+    cuDeviceGetAttribute(&shared_optin_bytes,
+                         CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                         device);
     cuFuncGetAttribute(&static_bytes, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
                        kernel->fn);
-    if (optin < static_cast<int>(entry.shared_bytes)) {
+    if (shared_optin_bytes < static_cast<int>(entry.shared_bytes)) {
       return "kernel needs more shared memory than the device offers";
     }
     cuFuncSetCacheConfig(kernel->fn, CU_FUNC_CACHE_PREFER_SHARED);
     result = cuFuncSetAttribute(kernel->fn,
                                 CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                optin - static_bytes);
-    if (result != CUDA_SUCCESS) return DriverError("cuFuncSetAttribute", result);
+                                shared_optin_bytes - static_bytes);
+    if (result != CUDA_SUCCESS)
+      return DriverError("cuFuncSetAttribute", result);
   }
   kernel->shared_bytes = entry.shared_bytes;
   kernel->num_warps = entry.num_warps;
@@ -177,7 +179,8 @@ std::string InitDevice(int device_index, DeviceKernels* state) {
                        device);
 
   std::vector<std::pair<const char*, Kernel*>> wanted;
-  for (int i = 0; i < 4; ++i) wanted.emplace_back(kGemmVariants[i], &state->gemm[i]);
+  for (int i = 0; i < 4; ++i)
+    wanted.emplace_back(kGemmVariants[i], &state->gemm[i]);
   wanted.emplace_back("silu_and_mul", &state->silu);
   for (auto& [variant, kernel] : wanted) {
     const CubinEntry* entry = FindCubin(variant, major, minor);
@@ -253,10 +256,21 @@ void LaunchGemm(const DeviceKernels& state, const Kernel& kernel,
   int64_t stride_be = 0;
   CUdeviceptr global_scratch = 0;
   CUdeviceptr profile_scratch = 0;
-  void* params[] = {&a,          &b,          &c,         &sorted_ids,
-                    &expert_ids, &num_post,   &n,         &k,
-                    &em,         &rows,       &stride_am, &stride_be,
-                    &stride_bn,  &stride_cm,  &global_scratch,
+  void* params[] = {&a,
+                    &b,
+                    &c,
+                    &sorted_ids,
+                    &expert_ids,
+                    &num_post,
+                    &n,
+                    &k,
+                    &em,
+                    &rows,
+                    &stride_am,
+                    &stride_be,
+                    &stride_bn,
+                    &stride_cm,
+                    &global_scratch,
                     &profile_scratch};
   unsigned grid = static_cast<unsigned>(CeilDiv(em, kernel.block_m) *
                                         CeilDiv(n, kernel.block_n));
@@ -271,8 +285,8 @@ void LaunchSilu(const Kernel& kernel, CUstream stream, CUdeviceptr x,
                 CUdeviceptr y, int n, int rows, int stride_xm, int stride_ym) {
   CUdeviceptr global_scratch = 0;
   CUdeviceptr profile_scratch = 0;
-  void* params[] = {&x,         &y,         &n, &stride_xm, &stride_ym,
-                    &global_scratch, &profile_scratch};
+  void* params[] = {
+      &x, &y, &n, &stride_xm, &stride_ym, &global_scratch, &profile_scratch};
   unsigned grid_y = static_cast<unsigned>(CeilDiv(n, kernel.block_n));
   CUresult result = cuLaunchKernel(
       kernel.fn, static_cast<unsigned>(rows), grid_y, 1, kernel.num_warps * 32,
@@ -352,8 +366,8 @@ bool ExpertFFN(const torch::Tensor& input, const torch::Tensor& gate,
     if (!t->is_contiguous()) return Fallback("tensors must be contiguous");
     if (!Aligned(*t)) return Fallback("tensors must be 16-byte aligned");
   }
-  if (input.dim() != 2 || gate.dim() != 2 || up.dim() != 2 ||
-      down.dim() != 2 || output.dim() != 2) {
+  if (input.dim() != 2 || gate.dim() != 2 || up.dim() != 2 || down.dim() != 2 ||
+      output.dim() != 2) {
     return Fallback("expected 2-D activations and weights");
   }
   const int64_t rows = input.size(0);
@@ -371,9 +385,8 @@ bool ExpertFFN(const torch::Tensor& input, const torch::Tensor& gate,
   if (2 * n > INT32_MAX || h > INT32_MAX || k > INT32_MAX) {
     return Fallback("dimension exceeds int32");
   }
-  const int64_t chunk_rows =
-      std::min({rows, gate_up_buf.numel() / (2 * n), act_buf.numel() / n,
-                kMaxChunkRows});
+  const int64_t chunk_rows = std::min({rows, gate_up_buf.numel() / (2 * n),
+                                       act_buf.numel() / n, kMaxChunkRows});
   if (chunk_rows <= 0) return Fallback("scratch buffers are too small");
 
   const DeviceKernels& state = GetDeviceKernels(input.get_device());

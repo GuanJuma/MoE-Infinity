@@ -39,9 +39,7 @@ def load_vendor_module() -> Any:
     importable).
     """
     if __package__:
-        return importlib.import_module(
-            f"{__package__}.vendor.fused_moe_bf16"
-        )
+        return importlib.import_module(f"{__package__}.vendor.fused_moe_bf16")
     name = "_moe_infinity_batchgen_vendor"
     if f"{name}.fused_moe_bf16" in sys.modules:
         return sys.modules[f"{name}.fused_moe_bf16"]
