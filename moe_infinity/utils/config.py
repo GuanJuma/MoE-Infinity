@@ -150,6 +150,18 @@ class ArcherConfig:
             )
         },
     )
+    expert_kernel: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Kernel for the on-GPU FFN of fetched experts. None follows "
+                "MOE_EXPERT_KERNEL (unset = 'default', the CUTLASS fused MLP); "
+                "'batchgen' uses BatchGen's grouped-GEMM kernels and falls "
+                "back to 'default' for unsupported experts. Offloading, "
+                "prefetch and caching are unaffected."
+            )
+        },
+    )
     expert_drop_policy: str = field(
         default="off",
         metadata={
@@ -641,6 +653,11 @@ class ArcherConfig:
             raise ValueError(
                 "adaptive_resident_mode must be 'legacy' or 'uniform_fp8', "
                 f"got {self.adaptive_resident_mode!r}"
+            )
+        if self.expert_kernel not in (None, "default", "batchgen"):
+            raise ValueError(
+                "expert_kernel must be None, 'default' or 'batchgen', "
+                f"got {self.expert_kernel!r}"
             )
         if self.expert_drop_policy not in ("off", "on_miss"):
             raise ValueError(

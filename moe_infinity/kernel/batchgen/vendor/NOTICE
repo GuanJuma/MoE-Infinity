@@ -1,0 +1,23 @@
+BatchGen
+Copyright (c) 2025-2026 BatchGen Team
+
+This directory contains code from BatchGen, licensed under the Apache License,
+Version 2.0 (see LICENSE in this directory).
+Source: https://github.com/batchgen-project/batchgen
+Commit: dc170ac27b7ac1fe2e6470da49112339ca5438cf
+
+Files taken from BatchGen (modifications are listed in each file header):
+  fused_moe_bf16.py    <- batchgen_kernels/triton/fused_moe_bf16.py
+  moe_weighted_sum.py  <- batchgen_kernels/triton/moe_weighted_sum.py
+
+BatchGen's fused_moe_bf16 kernel is itself described upstream as a Triton port
+of the vLLM fused_moe kernel (vLLM, The vLLM team, Apache-2.0).
+
+BatchGen asks that work using its code cite the BatchGen repository and/or:
+
+  Tairan Xu, Leyang Xue, Zhan Lu, Jinfu Deng, Hongyang Xiao, Yinsicheng Jiang,
+  Congjie He, Matej Sandor, Le Xu, and Luo Mai. "BatchGen: An Architecture for
+  Scalable and Efficient Batch Inference." In 20th USENIX Symposium on
+  Operating Systems Design and Implementation (OSDI 26), pages 1125-1141,
+  Seattle, WA, July 2026. USENIX Association.
+  https://www.usenix.org/conference/osdi26/presentation/xu-tairan

@@ -1304,6 +1304,21 @@ class OffloadEngine(object):
 
                 self.expert_prefetcher = ExpertPrefetcher(self.config)
                 self.expert_prefetcher.set_archer_engine(self.archer_engine)
+                expert_kernel = getattr(
+                    self.archer_config, "expert_kernel", None
+                )
+                if expert_kernel is not None:
+                    if hasattr(self.prefetch_lib, "set_expert_kernel"):
+                        self.prefetch_lib.set_expert_kernel(expert_kernel)
+                    elif expert_kernel != "default":
+                        warnings.warn(
+                            "moe_infinity._store was built without "
+                            "set_expert_kernel; expert_kernel="
+                            f"{expert_kernel!r} is ignored. Rebuild the "
+                            "extension to use BatchGen expert kernels.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
                 self.expert_dispatcher = self.prefetch_lib.expert_dispatcher(
                     self.num_experts,
                     self.num_layers,

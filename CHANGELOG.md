@@ -12,6 +12,7 @@ All notable changes to MoE-Infinity will be documented in this file.
 
 ### Added
 
+- Opt-in BatchGen expert kernels (`MOE_EXPERT_KERNEL=batchgen` or `ArcherConfig.expert_kernel="batchgen"`, default off). The native dispatcher can now run the on-GPU FFN of fetched BF16 gated-SiLU experts on BatchGen's grouped-GEMM Triton kernels. The kernels are vendored under Apache-2.0 and AOT-compiled to cubins at build time (`MOE_BUILD_BATCHGEN`). Unsupported experts fall back per call to the CUTLASS fused MLP. Offloading, prefetch and caching are unchanged. See `docs/batchgen-expert-kernels.md`. No speedup is claimed yet.
 - Opt-in phase-specific expert admission, prefetch, eviction, and telemetry over one shared residency manager, with the legacy policy retained by default and one-flag rollback requiring no offload-store migration.
 - Opt-in `int8_sym` KV-cache storage format (`kv_cache_format`, default `native`): symmetric INT8 payload plus one FP16 scale per `(layer, page, KV head, token)`, with a native CUDA decode kernel, a validated FP32 dequantized SDPA fallback, single-owner `LayeredPagedKVStore` lifecycle, capability-gated selection with visible native/MLA fallback, numerical/logit/storage quality gates, a long-context A/B benchmark matrix, and a one-setting (`--kv-cache-format native`) rollback. No universal low-bit KV support is claimed.
 - Documentation hub at `docs/README.md` for users, operators, contributors, and project-history readers.

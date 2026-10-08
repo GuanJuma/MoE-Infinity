@@ -120,6 +120,9 @@ moe_infinity/
 │   └── expert_prefetcher.py   DistributedExpertPrefetcher: cross-rank prefetch
 │
 ├── kernel/              Custom kernels (Triton / CUDA adapters)
+│   ├── batchgen/              Vendored BatchGen MoE kernels + AOT cubin
+│   │                          build for the native expert FFN
+│   │                          (MOE_EXPERT_KERNEL=batchgen)
 │   ├── router.py              Fused softmax+topk router
 │   ├── sglang_adapter.py      sglang topk_softmax adapter
 │   └── paged_attention_ops.py Paged attention forward ops

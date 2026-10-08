@@ -12,3 +12,20 @@
   year         = {2024}
 }
 ```
+
+The optional BatchGen expert kernels (`moe_infinity/kernel/batchgen/`) come
+from BatchGen; please also cite it when using them:
+
+```bibtex
+@inproceedings{batchgen-osdi26,
+  author    = {Tairan Xu and Leyang Xue and Zhan Lu and Jinfu Deng and
+               Hongyang Xiao and Yinsicheng Jiang and Congjie He and
+               Matej Sandor and Le Xu and Luo Mai},
+  title     = {BatchGen: An Architecture for Scalable and Efficient Batch Inference},
+  booktitle = {20th USENIX Symposium on Operating Systems Design and
+               Implementation (OSDI 26)},
+  pages     = {1125--1141},
+  year      = {2026},
+  url       = {https://www.usenix.org/conference/osdi26/presentation/xu-tairan}
+}
+```
