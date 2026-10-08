@@ -8,6 +8,10 @@
 #include "prefetch/archer_prefetch_handle.h"
 #include "model/moe.h"
 #include "kernel/ops.h"
+#include "kernel/fused_moe_mlp.h"
+#include "model/batchgen_moe.h"
+
+#include <ATen/cuda/CUDAContext.h>
 
 void BindTensorStoreSurface(py::class_<ArcherPrefetchHandle>& cls);
 
@@ -151,6 +155,61 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("reset_cache", &ArcherPrefetchHandle::ResetCache);
   //    .def("set_node_cache_priority",
   //    &ArcherPrefetchHandle::SetNodeCachePriority);
+
+  m.def(
+      "set_expert_kernel",
+      [](const std::string& name) { batchgen::SetExpertKernel(name); },
+      py::arg("name"),
+      "Select the expert FFN kernel: 'default' or 'batchgen'.");
+  m.def("get_expert_kernel", []() {
+    return batchgen::ExpertKernelName(batchgen::GetExpertKernel());
+  });
+  m.def("batchgen_expert_kernel_stats", []() {
+    auto stats = batchgen::GetStats();
+    py::dict result;
+    result["compiled_in"] = batchgen::CompiledIn();
+    result["compiled_archs"] = batchgen::CompiledArchs();
+    result["loaded_archs"] = stats.loaded_archs;
+    result["active_kernel"] =
+        batchgen::ExpertKernelName(batchgen::GetExpertKernel());
+    result["expert_calls"] = stats.expert_calls;
+    result["packed_gate_up_calls"] = stats.packed_gate_up_calls;
+    result["fallback_calls"] = stats.fallback_calls;
+    result["last_fallback_reason"] = stats.last_fallback_reason;
+    return result;
+  });
+  m.def("reset_batchgen_expert_kernel_stats", &batchgen::ResetStats);
+  m.def(
+      "batchgen_expert_ffn",
+      [](torch::Tensor x, torch::Tensor gate, torch::Tensor up,
+         torch::Tensor down) {
+        auto output = torch::empty({x.size(0), down.size(0)}, x.options());
+        auto gate_up = torch::empty({x.size(0), 2 * gate.size(0)}, x.options());
+        auto act = torch::empty({x.size(0), gate.size(0)}, x.options());
+        auto stream = at::cuda::getCurrentCUDAStream(x.get_device()).stream();
+        TORCH_CHECK(batchgen::ExpertFFN(x, gate, up, down, gate_up, act,
+                                        output, stream),
+                    "BatchGen expert kernel unavailable: ",
+                    batchgen::GetStats().last_fallback_reason);
+        return output;
+      },
+      py::arg("x"), py::arg("gate"), py::arg("up"), py::arg("down"),
+      "One expert's (silu(x@gate^T) * (x@up^T)) @ down^T on BatchGen kernels, "
+      "exactly as the dispatcher runs it.");
+  m.def(
+      "default_expert_ffn",
+      [](torch::Tensor x, torch::Tensor gate, torch::Tensor up,
+         torch::Tensor down) {
+        auto output = torch::empty({x.size(0), down.size(0)}, x.options());
+        auto gate_buf = torch::empty({x.size(0), gate.size(0)}, x.options());
+        auto fused_buf = torch::empty({x.size(0), gate.size(0)}, x.options());
+        auto stream = at::cuda::getCurrentCUDAStream(x.get_device()).stream();
+        fused_moe_ffn_into(x, gate, up, down, gate_buf, fused_buf, output,
+                           stream);
+        return output;
+      },
+      py::arg("x"), py::arg("gate"), py::arg("up"), py::arg("down"),
+      "Same expert FFN on the default CUTLASS kernel (fused_moe_ffn_into).");
 
   m.def("silu_and_mul", &silu_and_mul, "Fused SiLU(gate) * up");
   m.def("gelu_and_mul", &gelu_and_mul, "Fused GeLU(gate) * up");

@@ -22,6 +22,7 @@ set(ARCHER_CORE_CXX_SOURCES
   # parallel
   ${CMAKE_SOURCE_DIR}/core/parallel/expert_dispatcher.cpp
   ${CMAKE_SOURCE_DIR}/core/parallel/expert_module.cpp
+  ${CMAKE_SOURCE_DIR}/core/model/batchgen_moe.cpp
   # store
   ${CMAKE_SOURCE_DIR}/core/store/tensor_store.cpp
   ${CMAKE_SOURCE_DIR}/core/store/v2_index_loader.cpp
@@ -75,6 +76,30 @@ if(NOT DEFINED MOE_STORE_CSRC)
 endif()
 
 target_sources(archer_core PRIVATE ${MOE_STORE_CSRC}/index_v2.cc)
+
+# BatchGen expert-FFN cubins (moe_infinity/kernel/batchgen/aot.py), embedded
+# into archer_core; MOE_EXPERT_KERNEL=batchgen selects them at runtime.
+option(MOE_BUILD_BATCHGEN "Embed BatchGen expert-FFN kernels" ON)
+if(MOE_BUILD_BATCHGEN)
+  set(_BATCHGEN_AOT_DIR "${CMAKE_BINARY_DIR}/batchgen_aot")
+  string(REPLACE ";" "," _BATCHGEN_ARCHS "${CMAKE_CUDA_ARCHITECTURES}")
+  string(REGEX REPLACE "-(real|virtual)" "" _BATCHGEN_ARCHS "${_BATCHGEN_ARCHS}")
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/moe_infinity/kernel/batchgen/aot.py"
+            --archs "${_BATCHGEN_ARCHS}"
+            --out "${_BATCHGEN_AOT_DIR}/batchgen_moe_cubins.h"
+    RESULT_VARIABLE _BATCHGEN_RET
+    OUTPUT_VARIABLE _BATCHGEN_OUT
+    ERROR_VARIABLE _BATCHGEN_ERR)
+  if(_BATCHGEN_RET EQUAL 0)
+    message(STATUS "${_BATCHGEN_OUT}")
+    target_include_directories(archer_core PRIVATE ${_BATCHGEN_AOT_DIR})
+    target_compile_definitions(archer_core PRIVATE MOE_WITH_BATCHGEN=1)
+  else()
+    message(WARNING "BatchGen expert kernels not embedded: ${_BATCHGEN_ERR}")
+  endif()
+endif()
 
 target_include_directories(archer_core PUBLIC
   ${MOE_STORE_CSRC}
