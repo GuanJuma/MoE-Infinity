@@ -942,6 +942,13 @@ def parse_args(argv=None):
         "to the GPU node's physical cores (+ memory) and use that many threads",
     )
     p.add_argument(
+        "--omp-pin",
+        default="auto",
+        choices=("auto", "off"),
+        help="auto: if no OpenMP pinning is set, restart the process once with "
+        "OMP_PROC_BIND=close and one place per physical core of the GPU's NUMA node",
+    )
+    p.add_argument(
         "--malloc-reuse",
         default="on",
         choices=("on", "off"),
@@ -1081,8 +1088,25 @@ def prepare_host(args):
         print(f"NUMA binding: {setup['bind']}")
     if args.cpu_threads > 0:
         torch.set_num_threads(args.cpu_threads)
-    allowed = os.sched_getaffinity(0)
+    pinned = bench_env.omp_pinned()
+    if pinned and os.environ.get("EP_ALLOWED_CPUS"):
+        # libgomp has bound this (master) thread to one place already.
+        allowed = bench_env.parse_cpulist(os.environ["EP_ALLOWED_CPUS"])
+    else:
+        allowed = os.sched_getaffinity(0)
     phys = bench_env.physical_cores(allowed)
+    setup["omp_pinning"] = {
+        k: os.environ.get(k)
+        for k in bench_env.OMP_PIN_VARS
+        if os.environ.get(k)
+    }
+    if not pinned and torch.get_num_threads() >= 16:
+        warns.append(
+            f"OpenMP threads are not pinned ({torch.get_num_threads()} threads): on a fully "
+            f"used core set they get stacked and stall for a time slice per barrier (tens of "
+            f"ms per call). Use run_sweep.sh, or start with OMP_PROC_BIND=close "
+            f"OMP_PLACES=cores (or --omp-pin auto, the default for direct runs)"
+        )
     nodes = bench_env.numa_nodes()
     spanned = sorted(n for n, c in nodes.items() if c & allowed)
     setup["mempolicy"] = bench_env.mempolicy()
@@ -1097,7 +1121,9 @@ def prepare_host(args):
     setup["allowed_cpus"] = len(allowed)
     setup["allowed_physical_cores"] = len(phys)
     setup["allowed_numa_nodes"] = spanned
-    if torch.get_num_threads() > len(phys):
+    if not (
+        pinned and not os.environ.get("EP_ALLOWED_CPUS")
+    ) and torch.get_num_threads() > len(phys):
         warns.append(
             f"{torch.get_num_threads()} CPU threads > {len(phys)} allowed physical cores "
             f"(SMT siblings or oversubscription)"
@@ -1607,7 +1633,47 @@ DEFINITIONS = {
 }
 
 
+def maybe_reexec_pinned(argv) -> None:
+    """Direct runs: restart once with OpenMP pinned to the GPU node's physical
+    cores (libgomp reads its affinity variables only at start-up)."""
+    if os.environ.get("EP_REEXEC") or bench_env.omp_pinned():
+        return
+    try:
+        args = parse_args(argv)
+    except SystemExit:
+        return
+    if args.omp_pin != "auto" or args.list_experts or args.device != "cuda":
+        return
+    affinity = set(os.sched_getaffinity(0))
+    if args.cpu_bind:
+        cores = sorted(bench_env.parse_cpulist(args.cpu_bind))
+        node = args.membind_node
+    else:
+        plan = bench_env.numa_plan(
+            affinity, bench_env.numa_nodes(), bench_env.gpu_numa_node()
+        )
+        if plan["action"] == "bind":
+            cores, node = plan["cpus"], plan["gpu_node"]
+        else:
+            cores, node = bench_env.physical_cores(affinity), args.membind_node
+    if not cores:
+        return
+    env = dict(os.environ)
+    env.update(bench_env.pinning_env(cores, args.cpu_threads or None))
+    env["EP_REEXEC"] = "1"
+    extra = []
+    if node is not None and args.membind_node is None:
+        extra = ["--membind-node", str(node)]
+    print(
+        f"restarting with OpenMP pinned to {len(cores)} cores "
+        f"({env['OMP_PLACES'][:40]}...), memory node {node}",
+        flush=True,
+    )
+    os.execve(sys.executable, [sys.executable, __file__, *argv, *extra], env)
+
+
 if __name__ == "__main__":
+    maybe_reexec_pinned(sys.argv[1:])
     rc = main()
     if mi_expert_store.LIVE_ENGINES:
         # Outputs are written; skip native teardown (see mi_expert_store).

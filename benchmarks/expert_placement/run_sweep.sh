@@ -11,6 +11,7 @@
 #            GPU_KERNELS CPU_KERNELS FETCH_MODES REPEATS CPU_THREADS
 #            NUMA_NODE (auto) SKIP_DRY_RUN=1 IDLE_MIB REQUIRE_STORE=0 (--expert-store torch)
 #            EXCLUDE_CPUS (e.g. 0-7) OUT_OWNER (uid:gid for the outputs; default: repo owner)
+#            OMP_PIN=0 (do not pin OpenMP threads; diagnostics only)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -97,7 +98,17 @@ fi
 n_phys=$(echo "$phys" | tr ',' '\n' | wc -l)
 CPU_THREADS="${CPU_THREADS:-$n_phys}"
 export OMP_NUM_THREADS="$CPU_THREADS"
-echo "GPU NUMA node ${NUMA_NODE}; ${n_phys} physical cores (${phys}); ${CPU_THREADS} CPU threads"
+# Pin one OpenMP thread per physical core (explicit places, so this holds with
+# numactl or with the in-process binding). Unpinned spin-waiting threads on a
+# fully used core set get stacked and stall a time slice per barrier.
+# OMP_PIN=0 keeps the old unpinned behaviour (diagnostics only).
+if [ "${OMP_PIN:-1}" = "1" ] && [ -z "${OMP_PROC_BIND:-}${OMP_PLACES:-}${GOMP_CPU_AFFINITY:-}" ]; then
+    places=$(echo "$phys" | tr ',' '\n' | head -n "$CPU_THREADS" | sed 's/.*/{&}/' | paste -sd, -)
+    export OMP_PROC_BIND=close OMP_PLACES="$places"
+fi
+export EP_ALLOWED_CPUS="$(echo "$phys" | tr ',' '\n' | head -n "$CPU_THREADS" | paste -sd, -)"
+export EP_REEXEC=1
+echo "GPU NUMA node ${NUMA_NODE}; ${n_phys} physical cores (${phys}); ${CPU_THREADS} CPU threads; OMP_PROC_BIND=${OMP_PROC_BIND:-unset}"
 
 PYBIND=()
 if command -v numactl >/dev/null 2>&1 && numactl --membind="$NUMA_NODE" true 2>/dev/null; then

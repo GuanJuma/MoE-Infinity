@@ -18,7 +18,7 @@ PRECISIONS="${PRECISIONS:-fp8 bf16}"
 export TOKENS="${TOKENS:-1,2,4,5,8,16,64,512,4096}"
 export REPEATS="${REPEATS:-15}"
 export SCENARIOS=cpu SKIP_DRY_RUN=1
-ALL="base cpuw_torch no_engine omp_bind omp_passive no_flush skip_cpu0_7 threads_48 malloc_off avx2_isa onednn_verbose"
+ALL="base unpinned unpinned_no_engine cpuw_torch omp_passive no_flush skip_cpu0_7 threads_48 malloc_off avx2_isa onednn_verbose"
 VARIANTS="${VARIANTS:-$ALL}"
 mkdir -p "$OUT"
 
@@ -38,10 +38,11 @@ run() {  # run NAME PRECISION [VAR=value ...] -- [bench args ...]
 for P in $PRECISIONS; do
     for V in $VARIANTS; do
         case "$V" in
-            base)           run base "$P" ;;
+            base)           run base "$P" ;;   # pinned OpenMP (default since 70438fb+)
+            unpinned)       run unpinned "$P" OMP_PIN=0 ;;
+            unpinned_no_engine) run unpinned_no_engine "$P" OMP_PIN=0 REQUIRE_STORE=0 -- --expert-store torch ;;
             cpuw_torch)     run cpuw_torch "$P" -- --cpu-weights torch ;;
             no_engine)      run no_engine "$P" REQUIRE_STORE=0 -- --expert-store torch ;;
-            omp_bind)       run omp_bind "$P" OMP_PROC_BIND=close OMP_PLACES=cores ;;
             omp_passive)    run omp_passive "$P" OMP_WAIT_POLICY=PASSIVE ;;
             no_flush)       run no_flush "$P" -- --cpu-llc-flush-mb 0 ;;
             skip_cpu0_7)    run skip_cpu0_7 "$P" EXCLUDE_CPUS=0-7 ;;

@@ -516,7 +516,8 @@ def page_nodes(t: "torch.Tensor", samples: int = 256) -> dict:
     arr = (ctypes.c_void_p * len(addrs))(*addrs)
     status = (ctypes.c_int * len(addrs))()
     if libc.syscall(_SYS_MOVE_PAGES, 0, len(addrs), arr, None, status, 0) != 0:
-        return {"error": os.strerror(ctypes.get_errno())}
+        err = os.strerror(ctypes.get_errno())
+        return numa_maps_nodes(t.data_ptr()) or {"error": err}
     hist = {}
     for s in status:
         key = str(s) if s >= 0 else f"err{-s}"
@@ -557,3 +558,71 @@ def cpu_busy(cpus, seconds: float = 0.5) -> dict:
         "cpus_over_50pct": [c for c, v in busy if v > 50],
         "top": [(c, round(v, 1)) for c, v in busy[:8]],
     }
+
+
+OMP_PIN_VARS = (
+    "OMP_PROC_BIND",
+    "OMP_PLACES",
+    "GOMP_CPU_AFFINITY",
+    "KMP_AFFINITY",
+)
+
+
+def omp_pinned(env=None) -> bool:
+    env = os.environ if env is None else env
+    v = env.get("OMP_PROC_BIND", "").strip().lower()
+    return bool(v and v != "false") or any(env.get(k) for k in OMP_PIN_VARS[1:])
+
+
+def pinning_env(cores, threads: Optional[int] = None) -> Dict[str, str]:
+    """OpenMP pinning for ``cores`` (absolute CPU ids, one thread each).
+
+    Unpinned OpenMP threads that spin-wait on a fully subscribed core set get
+    stacked two-per-core by the scheduler whenever other runnable threads
+    appear (MoE-Infinity's task-pool threads, host agents); every barrier then
+    waits out a time slice (tens of ms per call).  Pinning one thread per core
+    removes that.  libgomp reads these variables only at start-up.
+    """
+    cores = list(cores)
+    n = len(cores) if not threads else min(int(threads), len(cores))
+    return {
+        "OMP_PROC_BIND": "close",
+        "OMP_PLACES": ",".join("{%d}" % c for c in cores[:n]),
+        "OMP_NUM_THREADS": str(n),
+        "EP_ALLOWED_CPUS": ",".join(map(str, cores[:n])),
+    }
+
+
+def numa_maps_nodes(addr: int, text: Optional[str] = None) -> dict:
+    """Pages per NUMA node of the mapping that contains ``addr``
+    (/proc/self/numa_maps; works where move_pages is not permitted)."""
+    if text is None:
+        try:
+            text = Path("/proc/self/numa_maps").read_text()
+        except OSError:
+            return {}
+    best = None
+    for line in text.splitlines():
+        f = line.split()
+        if not f:
+            continue
+        try:
+            start = int(f[0], 16)
+        except ValueError:
+            continue
+        if start <= addr and (best is None or start > best[0]):
+            best = (start, f[1:])
+    if best is None:
+        return {}
+    out = {}
+    for tok in best[1]:
+        if (
+            tok.startswith("N")
+            and "=" in tok
+            and tok[1:].split("=")[0].isdigit()
+        ):
+            node, cnt = tok[1:].split("=")
+            out[node] = out.get(node, 0) + int(cnt)
+    if out:
+        out["source"] = "numa_maps (whole mapping)"
+    return out

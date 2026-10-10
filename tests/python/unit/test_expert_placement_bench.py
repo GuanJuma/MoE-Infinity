@@ -992,7 +992,8 @@ def test_run_sweep_summarizes_even_if_the_bench_crashes(ckpts, tmp_path):
     # Run the real interpreter, but die with SIGSEGV after a full benchmark
     # run (like the native teardown crash), leaving results.json behind.
     (stub / "python3").write_text(
-        f'#!/bin/bash\n{sys.executable} "$@"; rc=$?\n'
+        f"#!/bin/bash\nenv | grep -E '^(OMP_|EP_)' > {tmp_path}/env.$$.txt\n"
+        f'{sys.executable} "$@"; rc=$?\n'
         'case "$*" in *expert_placement_bench.py*--tokens*) kill -SEGV $$;; esac\nexit $rc\n'
     )
     for f in stub.iterdir():
@@ -1016,6 +1017,9 @@ def test_run_sweep_summarizes_even_if_the_bench_crashes(ckpts, tmp_path):
     assert (out / "results.json").exists() and (
         out / "summary.md"
     ).exists(), p.stderr[-2000:]
+    envs = "".join(f.read_text() for f in tmp_path.glob("env.*.txt"))
+    assert "OMP_PROC_BIND=close" in envs and "OMP_PLACES={" in envs
+    assert "EP_REEXEC=1" in envs
 
 
 # -- diagnostics -------------------------------------------------------------------
@@ -1047,3 +1051,54 @@ def test_cpu_diag_summary_and_serial_s3_column(ckpts, tmp_path):
     assert "mempolicy" in hs and "host_cpu_busy_before_run" in hs
     pages = res["setup"]["cpu"][cpu_k]["weight_page_nodes"]
     assert pages and all(k.isdigit() or k.startswith("err") for k in pages)
+
+
+# -- OpenMP pinning (root cause of the server's S2 stalls) --------------------------
+
+
+def test_pinning_env_and_numa_maps_fallback():
+    env = importlib.import_module("bench_env")
+    pe = env.pinning_env([4, 5, 6, 7], threads=3)
+    assert pe["OMP_PROC_BIND"] == "close" and pe["OMP_PLACES"] == "{4},{5},{6}"
+    assert pe["OMP_NUM_THREADS"] == "3" and pe["EP_ALLOWED_CPUS"] == "4,5,6"
+    assert env.omp_pinned(pe) and not env.omp_pinned({})
+    assert not env.omp_pinned({"OMP_PROC_BIND": "false"})
+    maps = (
+        "7f0000000000 default anon=10 dirty=10 N0=6 N1=4 kernelpagesize_kB=4\n"
+        "7f0000100000 bind:0 anon=8 N0=8 kernelpagesize_kB=4\n"
+    )
+    got = env.numa_maps_nodes(0x7F0000000010, maps)
+    assert got == {"0": 6, "1": 4, "source": "numa_maps (whole mapping)"}
+    assert env.numa_maps_nodes(0x7F0000100100, maps)["0"] == 8
+    assert env.numa_maps_nodes(0x10, maps) == {}
+
+
+def test_direct_run_reexecs_pinned(monkeypatch):
+    env = importlib.import_module("bench_env")
+    calls = {}
+    monkeypatch.delenv("EP_REEXEC", raising=False)
+    for k in env.OMP_PIN_VARS:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(
+        env, "numa_nodes", lambda: {0: {0, 1, 2, 3}, 1: {4, 5, 6, 7}}
+    )
+    monkeypatch.setattr(env, "gpu_numa_node", lambda: 1)
+    monkeypatch.setattr(env, "physical_cores", lambda cpus: sorted(cpus))
+    monkeypatch.setattr(
+        bench.os, "sched_getaffinity", lambda pid: set(range(8))
+    )
+    monkeypatch.setattr(
+        bench.os, "execve", lambda exe, argv, e: calls.update(argv=argv, env=e)
+    )
+    bench.maybe_reexec_pinned(["--model-dir", "x"])
+    assert (
+        calls["env"]["OMP_PLACES"] == "{4},{5},{6},{7}"
+        and calls["env"]["EP_REEXEC"] == "1"
+    )
+    assert calls["argv"][-2:] == ["--membind-node", "1"]
+    calls.clear()
+    bench.maybe_reexec_pinned(["--model-dir", "x", "--omp-pin", "off"])
+    assert not calls
+    monkeypatch.setenv("OMP_PROC_BIND", "close")
+    bench.maybe_reexec_pinned(["--model-dir", "x"])
+    assert not calls
