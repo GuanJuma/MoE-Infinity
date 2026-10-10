@@ -58,6 +58,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
+trap 'exit 129' HUP
 
 iso plan > "$HOST_OUT/isolate_plan.txt" || exit 3
 grep -q "CONFLICT" "$HOST_OUT/isolate_plan.txt" && { cat "$HOST_OUT/isolate_plan.txt"; exit 3; }
