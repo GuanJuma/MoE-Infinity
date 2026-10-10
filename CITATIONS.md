@@ -13,6 +13,11 @@
 }
 ```
 
+The optional CPU expert kernels (`extensions/kernel/cpu/sglang/`, used by
+`moe_infinity/kernel/cpu/`) are SGLang's x86 CPU MoE/GEMM kernels
+(https://github.com/sgl-project/sglang, Apache-2.0, SGLang Team); see the
+NOTICE file in that directory for the pinned commit.
+
 The optional BatchGen expert kernels (`moe_infinity/kernel/batchgen/`) come
 from BatchGen; please also cite it when using them:
 

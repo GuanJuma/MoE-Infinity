@@ -55,6 +55,9 @@ prefetch/AIO and caching-allocator paths and are parsed with C `getenv`.
 | --- | --- | --- | --- | --- |
 | `MOE_INFINITY_MXFP4_DEQUANT` | unset, treated as off | `moe_infinity/runtime/model_offload.py` checkpoint load path | If `"1"`, dequantize MXFP4 weights to BF16 while loading the offload cache. | Only matters for MXFP4 checkpoints. |
 | `MOE_DSV4_FORCE_NATIVE` | unset, auto | `moe_infinity/models/deepseek_v4/official_offload_adapter.py` | If `"0"`, force the non-native DeepSeek-V4 path. Otherwise auto-select native on Blackwell when the extension is available. | An explicit `use_native` argument still wins. |
+| `MOE_CPU_EXPERTS` | unset, no CPU experts | `moe_infinity/runtime/model_offload.py` `_setup_cpu_experts` | Placement spec for experts computed on the CPU with the SGLang CPU kernels instead of being fetched to GPU: `all`, ids for every MoE layer (`0-7,12`), `ratio:0.25`, or per layer `3:0-7;5:1,2`. | `ArcherConfig.cpu_experts` wins when set. Needs x86 AVX512-BF16 and dense BF16/FP16 experts in the safetensors checkpoint. See [CPU expert offload](cpu-expert-offload.md). |
+| `MOE_CPU_EXPERTS_SYNC` | unset, async | `moe_infinity/runtime/cpu_experts.py` `CpuExpertBackend.submit` | If `"1"`, compute CPU experts inline in `dispatch_local` instead of on the worker thread. | Debugging aid. |
+| `MOE_CPU_MOE_JIT` | unset, treated as `"1"` | `moe_infinity/kernel/cpu/_ext.py` | When `moe_infinity._cpu_moe` was not built, JIT-compile the CPU kernels from `extensions/kernel/cpu` on first use. `"0"` raises instead. | `MOE_CPU_MOE_JIT_VERBOSE=1` prints the compiler output. |
 
 For `CUDA_VISIBLE_DEVICES` ordering, expert ownership, and one-host multi-GPU behavior, see [Single-server multi-GPU](multi-gpu.md).
 
@@ -67,6 +70,7 @@ For `CUDA_VISIBLE_DEVICES` ordering, expert ownership, and one-host multi-GPU be
 | `NVTX_DISABLE` | `"0"` | `setup.py` build | If `"1"`, compile out NVTX instrumentation macros. | Build-time only. |
 | `MOE_ENABLE_SM90` | `"1"` | `setup.py` build | Include sm_90 kernels in the compiled extensions. | Build-time only. |
 | `MOE_ENABLE_SM120` | `"0"` | `setup.py` build | Include sm_120 kernels and the native FP4 extension arch flags. | Build-time only. |
+| `MOE_BUILD_CPU_MOE` | unset (auto) | `setup.py` build | Build `moe_infinity._cpu_moe` (vendored SGLang CPU MoE kernels). Unset builds it on x86_64 Linux when the compiler accepts the AMX/AVX512-BF16 flags, `"1"` makes a failure fatal, `"0"` skips it. | Build-time only. Without it the kernels are JIT-compiled on first use (`MOE_CPU_MOE_JIT`). CMake builds the `cpu_moe` target from `extensions/kernel/cpu`. |
 | `MOE_BUILD_BATCHGEN` | unset (auto) | `setup.py` build | Embed AOT-compiled BatchGen expert-FFN cubins into `_store` for the enabled SM archs. Unset builds them when Triton can compile, `"1"` makes a failure fatal, `"0"` skips them. | Build-time only. CMake uses the `MOE_BUILD_BATCHGEN` option and the `MOE_BATCHGEN_ARCHS` cache variable instead. |
 
 The package version is not set via an environment variable; it is derived from
