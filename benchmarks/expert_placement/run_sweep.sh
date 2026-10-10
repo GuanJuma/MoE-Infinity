@@ -30,7 +30,7 @@ export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/scratch/torch_extensions}"
 mkdir -p "$OUT"
 
-if ! python3 -c "import moe_infinity._store" 2>/dev/null; then
+if ! python3 -c "import torch, moe_infinity._store" 2>/dev/null; then
     echo "ERROR: moe_infinity._store is not built; S2/S3 need MoE-Infinity's expert store." >&2
     echo "       Build it: python3 $BENCH/build_extensions.py (see the guide)" >&2
     exit 4

@@ -57,8 +57,11 @@ if ! echo '#include <uuid/uuid.h>' | ${CXX:-g++} -x c++ -fsyntax-only - 2>/dev/n
     export CPATH="$B/uuid/include${CPATH:+:$CPATH}"
 fi
 if ! echo 'int main(){}' | ${CXX:-g++} -x c++ - -luuid -o /dev/null 2>/dev/null; then
-    so="$(ldconfig -p 2>/dev/null | awk '/libuuid\.so\.1 .*x86-64/{print $NF; exit}')"
-    so="${so:-$(ls /lib/x86_64-linux-gnu/libuuid.so.1 /usr/lib/x86_64-linux-gnu/libuuid.so.1 2>/dev/null | head -1)}"
+    ldc="$(command -v ldconfig || echo /sbin/ldconfig)"
+    so="$({ "$ldc" -p 2>/dev/null || true; } | awk '/libuuid\.so\.1 .*x86-64/{print $NF; exit}')"
+    for c in /lib/x86_64-linux-gnu/libuuid.so.1 /usr/lib/x86_64-linux-gnu/libuuid.so.1 /usr/lib64/libuuid.so.1; do
+        [ -n "$so" ] || { [ -e "$c" ] && so="$c"; } || true
+    done
     if [ -z "$so" ]; then
         echo "ERROR: no libuuid.so.1 on this system; _store cannot link -luuid" >&2
         exit 3
@@ -101,6 +104,9 @@ say "self-checks"
 cd "$REPO"
 $PY - <<'EOF'
 import importlib
+
+import torch  # noqa: F401  (loads libc10 / libcudart for the extensions)
+
 for mod, what in (
     ("moe_infinity._store", "MoE-Infinity expert store / fetch path"),
     ("moe_infinity._cpu_moe", "CPU expert kernels"),

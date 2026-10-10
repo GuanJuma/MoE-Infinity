@@ -111,6 +111,48 @@ warning is about `fused_moe_ffn_into`, the CUTLASS fused MLP in `MoEMLP`,
 which this benchmark never calls. The store, pools, task pool and fetch code
 are not tied to a torch version.
 
+### Offline servers (no GitHub, no PyPI)
+
+On a machine with network access (macOS or Linux), run:
+
+```bash
+bash benchmarks/expert_placement/make_offline_bundle.sh
+```
+
+This writes one `moe-ep-offline-<date>.tar.gz`, about 6 MB:
+
+| Path | Contents |
+| --- | --- |
+| `MoE-Infinity/` | The repo via `git archive`, without `.git` |
+| `cutlass/` | CUTLASS v3.9.2, only `include/` and `tools/util/include/`. These are the only CUTLASS dirs `setup.py` puts on `-I` |
+| `moe-store/` | moe-store v0.2.2 source |
+| `wheels/` | `ninja` and `setuptools-scm` |
+| `uuid/` | libuuid's `uuid.h`, for images without uuid-dev |
+
+Upload it with `rz -be` or `scp`, extract it under `/data1/scratch/<user>/`, and run inside the container:
+
+```bash
+bash <bundle>/MoE-Infinity/benchmarks/expert_placement/offline_setup.sh <bundle>
+source <bundle>/env.sh
+```
+
+`offline_setup.sh` does the following, with `PIP_NO_INDEX=1` throughout:
+
+1. Installs ninja and setuptools-scm from `wheels/`, only if they are missing.
+2. Runs `pip install --no-deps --no-build-isolation <bundle>/moe-store`. The
+   build itself reads `MOE_STORE_CSRC` from the bundle, so it does not depend
+   on this install succeeding.
+3. Falls back to the bundled `uuid.h` and the system `libuuid.so.1` when
+   uuid-dev is missing.
+4. Builds `_store` and `_cpu_moe` for sm_120.
+
+`numactl` and `matplotlib` are optional:
+
+- Without numactl, `run_sweep.sh` binds in-process (`--cpu-bind`,
+  `--membind-node`), using `sched_setaffinity` and `set_mempolicy`.
+- Without matplotlib, the summary is Markdown only. Run the same
+  `summarize_placement.py` locally to plot from the CSV/JSON.
+
 ## Usage
 
 ```bash

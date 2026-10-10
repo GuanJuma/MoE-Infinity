@@ -766,3 +766,50 @@ def test_dry_run(ckpts, tmp_path):
         tmp_path / "dry",
     )  # fmt: skip
     assert res["dry_run"] and {r["tokens"] for r in res["rows"]} == {1, 16}
+
+
+# -- offline deployment ------------------------------------------------------------
+
+
+def test_offline_scripts_parse_and_bundle_the_cutlass_dirs_setup_uses():
+    for name in ("make_offline_bundle.sh", "offline_setup.sh", "run_sweep.sh"):
+        subprocess.run(["bash", "-n", str(BENCH / name)], check=True)
+    setup = (REPO / "setup.py").read_text()
+    dirs = re.findall(r'os\.path\.join\(CUTLASS_DIR, "([^"]+)"\)', setup)
+    assert dirs == ["include", "tools/util/include"]
+    bundle = (BENCH / "make_offline_bundle.sh").read_text()
+    for d in dirs:
+        assert f'"$CUT_SRC/{d}"' in bundle, d
+    offline = (BENCH / "offline_setup.sh").read_text()
+    assert (
+        "PIP_NO_INDEX=1" in offline
+        and "--no-deps --no-build-isolation" in offline
+    )
+    assert "MOE_STORE_CSRC" in offline and "MOE_STORE_CSRC" in setup
+
+
+def test_in_process_numa_binding():
+    env = importlib.import_module("bench_env")
+    if sys.platform != "linux" or os.uname().machine != "x86_64":
+        pytest.skip("x86_64 Linux only")
+    code = textwrap.dedent(
+        f"""
+        import os, sys
+        sys.path.insert(0, {str(BENCH)!r})
+        import bench_env
+        cpu = sorted(os.sched_getaffinity(0))[0]
+        r = bench_env.bind_numa(str(cpu), 0)
+        assert r["cpus"] == [cpu], r
+        assert r["mempolicy"] == {{"mode": "MPOL_BIND", "nodes": [0]}}, r
+        print("ok")
+        """
+    )
+    p = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True
+    )
+    if "Operation not permitted" in p.stderr:
+        pytest.skip(
+            "set_mempolicy not permitted here (needs CAP_SYS_NICE in containers)"
+        )
+    assert p.returncode == 0 and "ok" in p.stdout, p.stderr
+    assert env.parse_cpulist("0-2,5, 7-8") == {0, 1, 2, 5, 7, 8}

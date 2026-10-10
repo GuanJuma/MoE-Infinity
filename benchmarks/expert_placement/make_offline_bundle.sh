@@ -102,9 +102,8 @@ cp "$WORK/dl/util-linux-$UTIL_LINUX_VER/Documentation/licenses/COPYING.BSD-3-Cla
     echo "  bash /scratch/<you>/moe-ep-offline/MoE-Infinity/benchmarks/expert_placement/offline_setup.sh \\"
     echo "       /scratch/<you>/moe-ep-offline"
 } > "$B/MANIFEST.txt"
-(cd "$B" && find . -type f ! -name SHA256SUMS -print0 | sort -z \
-    | xargs -0 shasum -a 256 2>/dev/null > SHA256SUMS \
-    || find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+if command -v shasum >/dev/null; then SHA=(shasum -a 256); else SHA=(sha256sum); fi
+(cd "$B" && find . -type f ! -name SHA256SUMS | LC_ALL=C sort | xargs "${SHA[@]}" > SHA256SUMS)
 
 tar -czf "$OUT" -C "$WORK" moe-ep-offline
 echo "bundle: $OUT ($(du -h "$OUT" | cut -f1))"
