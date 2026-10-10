@@ -520,6 +520,76 @@ if cuda_available:
         )
     )
 
+
+def _cpu_moe_extension():
+    """SGLang-derived CPU expert kernels -> moe_infinity._cpu_moe.
+
+    See docs/cpu-expert-offload.md. MOE_BUILD_CPU_MOE: unset = build on x86_64
+    Linux when the compiler accepts the AMX/AVX512-BF16 flags, "1" = required,
+    "0" = skip. Without the prebuilt module, moe_infinity.kernel.cpu
+    JIT-compiles the same sources on first use.
+    """
+    import importlib.util
+    import platform
+    import subprocess
+    import tempfile
+
+    mode = os.environ.get("MOE_BUILD_CPU_MOE", "auto")
+    if mode == "0" or torch is None:
+        return None
+
+    def skip(msg):
+        if mode == "1":
+            abort(msg)
+        print(f"{YELLOW_START}[WARNING]{YELLOW_END} {msg}")
+        return None
+
+    if platform.machine() not in (
+        "x86_64",
+        "AMD64",
+    ) or not sys.platform.startswith("linux"):
+        return skip("CPU MoE kernels need x86_64 Linux; not building _cpu_moe")
+    spec = importlib.util.spec_from_file_location(
+        "_cpu_moe_ext", get_path("moe_infinity", "kernel", "cpu", "_ext.py")
+    )
+    ext = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ext)
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "probe.cpp")
+        with open(src, "w") as f:
+            f.write("int main() { return 0; }\n")
+        probe = subprocess.run(
+            [
+                os.environ.get("CXX", "c++"),
+                *ext.CPU_MOE_CXX_FLAGS,
+                src,
+                "-o",
+                os.path.join(tmp, "probe"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+    if probe.returncode != 0:
+        return skip(
+            "compiler rejects the AMX/AVX512-BF16 flags; not building _cpu_moe:\n"
+            + probe.stderr[-1000:]
+        )
+    return cpp_extension.CppExtension(
+        name="moe_infinity._cpu_moe",
+        sources=[
+            os.path.join("extensions", "kernel", "cpu", s)
+            for s in ext.CPU_MOE_SOURCES
+        ],
+        include_dirs=[get_path("extensions", "kernel", "cpu", "sglang")],
+        extra_compile_args={"cxx": ext.CPU_MOE_CXX_FLAGS},
+        extra_link_args=["-fopenmp"],
+    )
+
+
+_cpu_moe = _cpu_moe_extension()
+if _cpu_moe is not None:
+    ext_modules.append(_cpu_moe)
+
 cmdclass = {
     "build_ext": cpp_extension.BuildExtension.with_options(use_ninja=True)
 }
