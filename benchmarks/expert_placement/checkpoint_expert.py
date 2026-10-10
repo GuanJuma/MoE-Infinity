@@ -244,6 +244,8 @@ def config_summary(cfg: dict) -> dict:
         "first_k_dense_replace": cfg.get("first_k_dense_replace"),
         "hidden_act": cfg.get("hidden_act", "silu"),
         "dtype": first("dtype", "torch_dtype") or "bfloat16",
+        "torch_dtype": cfg.get("torch_dtype"),
+        "quantization_config": cfg.get("quantization_config"),
         "quant_method": q.get("quant_method"),
         "activation_scheme": q.get("activation_scheme"),
         "weight_block_size": q.get("weight_block_size"),
@@ -407,6 +409,7 @@ class ExpertWeights:
     activation: str = "silu"
     act_dtype: torch.dtype = torch.bfloat16
     layout: str = "per_expert"
+    source: str = "checkpoint"
 
     @property
     def hidden_size(self) -> int:
@@ -436,6 +439,26 @@ class ExpertWeights:
                 n += p.scale.numel() * 4
         return n
 
+    def to_bf16(self) -> "ExpertWeights":
+        """The same expert dequantized to BF16: each projection is
+        ``fp8_code * its own weight_scale`` (gate and up keep their separate
+        scales; nothing is merged or requantized), rounded once to BF16."""
+        if not self.gate.is_fp8:
+            return self
+        projs = [
+            ProjWeight(p.role, p.dequant(torch.bfloat16), names=list(p.names))
+            for p in self.projs
+        ]
+        return ExpertWeights(
+            self.layer,
+            self.expert,
+            *projs,
+            activation=self.activation,
+            act_dtype=self.act_dtype,
+            layout=self.layout,
+            source=f"dequantized to BF16 from {self.quant} (w * weight_scale)",
+        )
+
     def static_input_scales(self) -> Tuple[Optional[float], Optional[float]]:
         """(a1, a2): max of gate/up input scales and the down input scale."""
         a1 = [
@@ -463,6 +486,7 @@ class ExpertWeights:
             "activation": self.activation,
             "act_dtype": str(self.act_dtype).replace("torch.", ""),
             "checkpoint_bytes": self.checkpoint_nbytes,
+            "source": self.source,
             "static_input_scale_gate_up": a1,
             "static_input_scale_down": a2,
             "projs": {},
