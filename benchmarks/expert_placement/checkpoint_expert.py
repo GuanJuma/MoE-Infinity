@@ -299,6 +299,7 @@ def discover_experts(index: SafetensorsIndex) -> Dict[int, LayerExperts]:
                 le.projs.append(m.group("proj"))
     for le in layers.values():
         le.expert_ids = sorted(set(le.expert_ids))
+        le.projs = sorted(le.projs)
     for le in layers.values():
         if le.kind == "stacked":
             name = _stacked_weight_name(

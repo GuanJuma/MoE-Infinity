@@ -485,7 +485,7 @@ class Bench:
 
         # Prove the kernel consumes the fetched bytes: wipe, fetch, run, check.
         for t in dst.values():
-            t.view(torch.uint8).zero_()
+            t.reshape(-1).view(torch.uint8).zero_()
         fetch()
         if reset:
             reset()

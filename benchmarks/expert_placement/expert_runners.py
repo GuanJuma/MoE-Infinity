@@ -197,8 +197,9 @@ def _gpu_prep(
                 "mode": "per_tensor",
             }
             if a1 is not None and a2 is not None:
-                t["a1_scale"] = torch.tensor([a1], dtype=torch.float32)
-                t["a2_scale"] = torch.tensor([a2], dtype=torch.float32)
+                # 0-dim, as Fp8MoEMethod stores w13/w2_input_scale.max().
+                t["a1_scale"] = torch.tensor(a1, dtype=torch.float32)
+                t["a2_scale"] = torch.tensor(a2, dtype=torch.float32)
                 meta["act_quant"] = "static (checkpoint input_scale)"
             else:
                 meta["act_quant"] = "dynamic per-tensor"

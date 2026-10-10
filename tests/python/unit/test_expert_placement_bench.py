@@ -367,6 +367,27 @@ def test_sglang_triton_adapter_wiring(ckpts, fake_sglang):
     assert "sglang_triton" in runners.resolve_gpu_kernels(["auto"], ew)
 
 
+def test_sweep_through_fake_sglang(ckpts, fake_sglang, tmp_path):
+    out = tmp_path / "sg"
+    rc = bench.main(
+        [
+            "--model-dir", str(ckpts["hy3_fp8"]), "--device", "cpu",
+            "--tokens", "1,8", "--scenarios", "gpu,fetch",
+            "--gpu-kernels", "sglang_triton", "--warmup", "1", "--repeats", "2",
+            "--min-repeats", "1", "--out-dir", str(out),
+        ]
+    )  # fmt: skip
+    assert rc == 0
+    res = json.loads((out / "results.json").read_text())
+    assert not res["errors"], res["errors"]
+    assert {r["variant"] for r in res["rows"]} == {
+        "sglang_triton",
+        "sglang_triton+pinned",
+        "sglang_triton+pageable",
+    }
+    assert all(r["rel_err"] < 0.15 for r in res["rows"])
+
+
 def test_sglang_missing_is_reported(ckpts, monkeypatch):
     monkeypatch.setattr(runners, "_SGLANG", {})
     monkeypatch.setitem(sys.modules, "sglang", None)
