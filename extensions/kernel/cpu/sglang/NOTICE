@@ -1,0 +1,18 @@
+SGLang
+Copyright 2023-2024 SGLang Team
+
+This directory contains code from SGLang, licensed under the Apache License,
+Version 2.0 (see LICENSE in this directory).
+Source: https://github.com/sgl-project/sglang
+Commit: a338b9858a4dd1dbb7a2c0e02f7b06d4909bd05c (2026-10-09)
+Upstream path: python/sglang/kernels/aot/csrc/cpu/ (formerly sgl-kernel/csrc/cpu/)
+
+Files are copied unmodified:
+  common.h  vec.h  gemm.h  moe.h
+  gemm.cpp  gemm_int8.cpp  gemm_fp8.cpp  gemm_int4.cpp
+  moe.cpp   moe_int8.cpp   moe_fp8.cpp   moe_int4.cpp
+
+SGLang's torch_extension_cpu.cpp is not vendored; MoE-Infinity registers the
+subset of ops it uses under the `moe_infinity_cpu` namespace in
+../cpu_moe_bindings.cpp (schemas copied from upstream), so the extension can be
+loaded side by side with an installed `sgl_kernel`.
