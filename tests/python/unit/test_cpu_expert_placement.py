@@ -195,6 +195,7 @@ class _FakeGpuDispatcher:
 )
 def test_executor_splits_experts_between_cpu_and_gpu(monkeypatch, cpu_ids):
     pytest.importorskip("transformers")
+    pytest.importorskip("moe_store")
     from moe_infinity.distributed.expert_executor import (
         DistributedExpertExecutor,
     )
