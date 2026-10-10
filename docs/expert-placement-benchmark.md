@@ -165,6 +165,30 @@ source <bundle>/env.sh
 | S3 comparison | Compare rows on `xfer_plus_kernel_ms`. `raw_pinned` copies asynchronously, so the eager call's Python dispatch overlaps the DMA. MoE-Infinity's `begin()` returns only once the expert is resident, as does `raw_pageable`. |
 | Teardown | `ArcherTaskPool`'s destructor detaches its GPU threads and then frees itself, which can segfault at exit. The harness therefore never tears the engine down and leaves via `os._exit` after writing all outputs. `run_sweep.sh` summarizes whenever `results.json` exists and chowns root-created outputs to the repo owner. |
 
+## S1 overhead split
+
+`overhead_ms` for S1 is the **exposed** overhead, `total − graph kernel`. The
+eager call's host dispatch (`host_dispatch_ms`, wall time until the call
+returns, no sync) is roughly constant, around 0.2–0.27 ms for the SGLang
+Triton path. While it outlasts the kernels (small M), the GPU waits for it and
+nearly all of it is exposed. Once kernels run longer, dispatch overlaps GPU
+execution and only the tail stays exposed, so exposed overhead falls with M.
+`hidden_dispatch_ms = max(0, dispatch − exposed)` reports the overlapped part.
+`launches_per_call` counts the kernel nodes of a separate, never-replayed
+CUDA-graph capture of one call (`graph_nodes` in the JSON also counts
+memcpy/memset nodes).
+
+## CPU isolation and interference
+
+| Mode | What it does |
+| --- | --- |
+| Interference accounting (always) | Each row records schedstat run-queue delay, context switches and migrations of our threads (compute threads for S2, the main thread for every scenario). `interfered` flags rows over `--interference-delay-ms` (1 ms), and `--retry-interfered N` re-measures flagged S2 rows. |
+| Pre-run noise check | `--noise-check-s` (10 in `run_sweep.sh`) samples foreign load on the compute CPUs and their SMT siblings. It warns above `--noise-warn-pct`, and aborts above `--noise-abort-pct` (30 under isolation). |
+| Soft isolation (`ISOLATE=1`) | Changes nothing outside our container. OpenMP workers run on the node's cores minus `HOUSEKEEPING` (default 0-7), with their SMT siblings idle. The main thread is the first OpenMP place: the housekeeping set by default, or `ISO_MAIN=compute`. MoE-Infinity's task-pool/AIO threads and other helper threads are re-pinned to the housekeeping set (`--engine-cpus`). The engine itself pins its task-pool threads to CPU `++counter % nprocs`. A background `interference_monitor.py` on the housekeeping CPUs samples foreign load per row. Start the container with `--cpuset-cpus=<node cores + SMT siblings> --cpuset-mems=<node>`. |
+| Repeat protocol | `s2_rounds.sh` runs ROUNDS S2 sweeps GAP_S apart. `summarize_rounds.py` reports per-M min-of-medians, spread and flagged rounds. |
+| Strict isolation (host, root) | `isolate_cpus.sh plan/apply/status/restore` targets cgroup v1 with docker. Other containers are shrunk with `docker update --cpuset-cpus` (originals saved). Root-cpuset host tasks move into `mi_housekeeping`, skipping kernel threads. Custom thread affinities are saved and re-applied on restore. Restore uses the state file and is idempotent. Option A (80-95 + SMT siblings) is the default; option B (8-95) needs `--admin-approved`. `cset shield` is not used because its reset drops tasks into the root cpuset. IRQ affinity is not changed. |
+| A/B | On the host, `ab_isolation.sh` runs S2 for both precisions on the same cores with the same thread count, shared vs isolated, for N rounds. Leg order alternates, isolation is always restored, and `ab_summary.md` holds the results. |
+
 ## Usage
 
 ```bash
