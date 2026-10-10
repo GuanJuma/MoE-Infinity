@@ -158,6 +158,7 @@ source <bundle>/env.sh
 | Topic | Behaviour |
 | --- | --- |
 | Host setup | `--numa auto` (default): if the process isn't bound and spans several NUMA nodes, it binds to the GPU node's physical cores and memory. |
+| OpenMP pinning | On by default. `run_sweep.sh` exports `OMP_PROC_BIND=close` with one explicit `OMP_PLACES` entry per physical core of the GPU node. A direct `expert_placement_bench.py` run restarts once with the same setting (`--omp-pin auto`). Without pinning, spin-waiting OpenMP threads on a fully used core set get stacked when other runnable threads appear, and each barrier stalls for a scheduler time slice. On the 2 × EPYC 9K84 server that produced 11–36 ms per-call plateaus; see the cpu_diag results. |
 | Allocator | `--malloc-reuse on` (default): keeps the CPU FP8 kernels' per-call scratch (`threads × 1 MiB`) mapped instead of re-faulting it on every call. |
 | Recorded facts | Every run stores the real `mempolicy`, the NUMA node of the weight pages, host CPU busy %, and per-repeat samples (`samples_ms`). |
 | `cpu_diag.sh` | Runs one S2-only variant per hypothesis and tabulates them with `summarize_diag.py`. Variants cover: weights in the pinned pool vs torch tensors; engine alive vs absent; OMP bind and wait policy; no flush; fewer threads; excluding CPUs 0–7 (the engine's task-pool threads are pinned there); malloc off; oneDNN ISA; and `ONEDNN_VERBOSE` brgemm aggregation. |
