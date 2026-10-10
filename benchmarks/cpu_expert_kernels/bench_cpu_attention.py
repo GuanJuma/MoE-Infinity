@@ -23,7 +23,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _bench_ext import host_info, load_bench_ext  # noqa: E402
-from bench_cpu_moe import bench  # noqa: E402
+from bench_cpu_moe import bench, set_cold_cache  # noqa: E402
 
 # name: (q heads, kv heads, head dim)
 ATTN = {
@@ -52,13 +52,21 @@ def main():
     ap.add_argument("--batches", nargs="+", type=int, default=[1, 4, 16, 64])
     ap.add_argument("--cache-lens", nargs="+", type=int, default=[512, 2048])
     ap.add_argument("--kv-splits", type=int, default=8)
+    ap.add_argument(
+        "--flush-mb",
+        type=int,
+        default=768,
+        help="LLC flush buffer touched before every timed call (0 = warm)",
+    )
     ap.add_argument("--json")
     args = ap.parse_args()
 
     ext = load_bench_ext(args.moegen_src, args.sglang_src)
     threads = torch.get_num_threads()
     info = host_info()
+    info["flush_mb"] = args.flush_mb
     print(json.dumps(info, indent=1))
+    set_cold_cache(args.flush_mb * 2**20)
     results = []
     for name in args.models:
         H, Hkv, D = ATTN[name]

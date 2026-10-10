@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import statistics
 import sys
 import time
@@ -36,6 +37,7 @@ from _bench_ext import host_info, load_bench_ext  # noqa: E402
 
 from moe_infinity.kernel.cpu import (  # noqa: E402
     CpuExpertQuant,
+    amx_selfcheck,
     fused_experts,
     pack_experts,
     reference_experts,
@@ -193,6 +195,14 @@ def measure_bandwidth():
     return gbps
 
 
+def measure_read_bandwidth():
+    a = torch.ones(1024 * 1024 * 1024 // 4, dtype=torch.float32)
+    t = bench(lambda: a.sum(), min_iters=5, min_time=0.5)
+    gbps = a.numel() * 4 / t / 1e9
+    del a
+    return gbps
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", nargs="+", default=list(MODELS))
@@ -214,6 +224,12 @@ def main():
     ap.add_argument("--sglang-src")
     ap.add_argument("--moegen-max-m", type=int, default=4)
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument(
+        "--flush-mb",
+        type=int,
+        default=768,
+        help="LLC flush buffer touched before every timed call (0 = warm)",
+    )
     ap.add_argument("--json")
     args = ap.parse_args()
 
@@ -224,7 +240,12 @@ def main():
         ext = load_bench_ext(args.moegen_src, args.sglang_src)
     info = host_info()
     info["copy_bandwidth_gbps"] = measure_bandwidth()
+    info["read_bandwidth_gbps"] = measure_read_bandwidth()
+    info["flush_mb"] = args.flush_mb
+    info["onednn_max_cpu_isa"] = os.environ.get("ONEDNN_MAX_CPU_ISA", "")
+    info["amx_selfcheck"] = amx_selfcheck()
     print(json.dumps(info, indent=1))
+    set_cold_cache(args.flush_mb * 2**20)
     results = []
     for name in args.models:
         run_model(name, args, ext, results)
