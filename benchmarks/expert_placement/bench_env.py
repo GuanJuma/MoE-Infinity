@@ -158,16 +158,34 @@ def cpu_facts(threads: int) -> dict:
     return d
 
 
-def l3_bytes() -> Optional[int]:
-    p = Path("/sys/devices/system/cpu/cpu0/cache/index3/size")
-    if not p.exists():
-        return None
+def _cache_size(p: Path) -> Optional[int]:
     s = p.read_text().strip().upper()
     mult = {"K": 2**10, "M": 2**20, "G": 2**30}.get(s[-1], 1)
     try:
         return int(s.rstrip("KMG")) * mult
     except ValueError:
         return None
+
+
+def l3_bytes() -> Optional[int]:
+    """Total L3 of the CPUs this process may run on (one per L3 instance:
+    AMD has one L3 per 8-core CCD, so cpu0's index3 alone is a fraction)."""
+    seen, total = set(), 0
+    try:
+        cpus = sorted(os.sched_getaffinity(0))
+    except AttributeError:
+        cpus = [0]
+    for c in cpus:
+        d = Path(f"/sys/devices/system/cpu/cpu{c}/cache/index3")
+        try:
+            key = (d / "shared_cpu_list").read_text().strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            total += _cache_size(d / "size") or 0
+        except OSError:
+            continue
+    return total or None
 
 
 def collect(out_dir: Path, device: torch.device, threads: int) -> dict:
@@ -330,3 +348,212 @@ def bind_numa(cpus: Optional[str], node: Optional[int]) -> dict:
                 ],
             }
     return out
+
+
+# glibc mallopt parameters (malloc.h).
+_M_TRIM_THRESHOLD = -1
+_M_MMAP_THRESHOLD = -3
+
+
+def tune_malloc() -> dict:
+    """Keep freed large CPU blocks mapped so per-call scratch is reused.
+
+    SGLang's CPU FP8 kernels allocate a fresh scratch buffer every call,
+    ``threads x 1 MiB`` (B_tmp), and the brgemm/AMX path (rows per expert
+    > 4) writes it.  Above glibc's mmap threshold (dynamic, at most 32 MiB)
+    every call mmaps/munmaps it and page-faults it in again, which adds
+    milliseconds once more than ~32 threads run.  Raising the mmap and trim
+    thresholds makes glibc reuse the block (what tcmalloc/jemalloc, which
+    Intel recommends for SGLang on CPU, do anyway).
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        ok = (
+            libc.mallopt(_M_MMAP_THRESHOLD, 1 << 30) == 1
+            and libc.mallopt(_M_TRIM_THRESHOLD, (1 << 31) - 1) == 1
+        )
+    except OSError as e:
+        return {"ok": False, "error": repr(e)}
+    return {
+        "ok": bool(ok),
+        "mmap_threshold": 1 << 30,
+        "trim_threshold": (1 << 31) - 1,
+    }
+
+
+def numa_nodes() -> Dict[int, set]:
+    nodes = {}
+    for d in Path("/sys/devices/system/node").glob("node[0-9]*"):
+        try:
+            nodes[int(d.name[4:])] = parse_cpulist((d / "cpulist").read_text())
+        except (OSError, ValueError):
+            continue
+    return nodes
+
+
+def physical_cores(cpus) -> list:
+    """One logical CPU per physical core (drop SMT siblings)."""
+    seen, keep = set(), []
+    for c in sorted(cpus):
+        p = Path(
+            f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
+        )
+        try:
+            sib = p.read_text().strip()
+        except OSError:
+            sib = str(c)
+        if sib not in seen:
+            seen.add(sib)
+            keep.append(c)
+    return keep
+
+
+def gpu_numa_node() -> Optional[int]:
+    """NUMA node of the GPU this process will use (cuda:0), without
+    initializing CUDA; None if it cannot be determined unambiguously."""
+    if shutil.which("nvidia-smi") is None:
+        return None
+    out = run_cmd(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,uuid,pci.bus_id",
+            "--format=csv,noheader",
+        ]
+    )
+    rows = [
+        [p.strip() for p in line.split(",")]
+        for line in out.splitlines()
+        if line.count(",") >= 2
+    ]
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+    if len(rows) == 1:
+        row = rows[0]
+    elif vis.startswith("GPU-"):
+        row = next((r for r in rows if r[1] == vis), None)
+    elif vis.isdigit() and os.environ.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID":
+        row = next((r for r in rows if r[0] == vis), None)
+    else:
+        return None
+    if row is None:
+        return None
+    bus = row[2].lower()
+    if len(bus.split(":")[0]) == 8:
+        bus = bus[4:]
+    try:
+        node = int(Path(f"/sys/bus/pci/devices/{bus}/numa_node").read_text())
+    except (OSError, ValueError):
+        return None
+    return max(node, 0)
+
+
+def numa_plan(
+    affinity: set, nodes: Dict[int, set], gpu_node: Optional[int]
+) -> dict:
+    """What an unbound process should do on a multi-node host."""
+    spanned = sorted(n for n, cpus in nodes.items() if cpus & affinity)
+    plan = {
+        "nodes": len(nodes),
+        "affinity_nodes": spanned,
+        "gpu_node": gpu_node,
+    }
+    if len(nodes) < 2 or len(spanned) < 2:
+        plan["action"] = "none"
+        return plan
+    if gpu_node is None or gpu_node not in nodes:
+        plan["action"] = "warn"
+        return plan
+    cores = physical_cores(nodes[gpu_node] & affinity)
+    plan.update(action="bind", cpus=cores, threads=len(cores))
+    return plan
+
+
+_SYS_MOVE_PAGES = 279
+
+
+def mempolicy() -> dict:
+    """The calling thread's actual memory policy (numactl --membind sets
+    this; /proc/self/status Mems_allowed_list is only the cpuset)."""
+    if platform.machine() != "x86_64":
+        return {}
+    libc = ctypes.CDLL(None, use_errno=True)
+    words = _MAX_NODES // (8 * ctypes.sizeof(ctypes.c_ulong))
+    bits = 8 * ctypes.sizeof(ctypes.c_ulong)
+    mode = ctypes.c_int(-1)
+    got = (ctypes.c_ulong * words)()
+    if (
+        libc.syscall(
+            _SYS_GET_MEMPOLICY, ctypes.byref(mode), got, _MAX_NODES + 1, None, 0
+        )
+        != 0
+    ):
+        return {"error": os.strerror(ctypes.get_errno())}
+    names = {
+        0: "MPOL_DEFAULT",
+        1: "MPOL_PREFERRED",
+        2: "MPOL_BIND",
+        3: "MPOL_INTERLEAVE",
+        4: "MPOL_LOCAL",
+    }
+    nodes = [i for i in range(_MAX_NODES) if got[i // bits] >> (i % bits) & 1]
+    return {"mode": names.get(mode.value, mode.value), "nodes": nodes}
+
+
+def page_nodes(t: "torch.Tensor", samples: int = 256) -> dict:
+    """NUMA node of the pages backing a CPU tensor (move_pages query)."""
+    if (
+        t.device.type != "cpu"
+        or platform.machine() != "x86_64"
+        or t.numel() == 0
+    ):
+        return {}
+    libc = ctypes.CDLL(None, use_errno=True)
+    page = os.sysconf("SC_PAGE_SIZE")
+    start = t.data_ptr() & ~(page - 1)
+    end = t.data_ptr() + t.numel() * t.element_size()
+    n_pages = max(1, (end - start) // page)
+    step = max(1, n_pages // samples)
+    addrs = [start + i * page for i in range(0, n_pages, step)][:samples]
+    arr = (ctypes.c_void_p * len(addrs))(*addrs)
+    status = (ctypes.c_int * len(addrs))()
+    if libc.syscall(_SYS_MOVE_PAGES, 0, len(addrs), arr, None, status, 0) != 0:
+        return {"error": os.strerror(ctypes.get_errno())}
+    hist = {}
+    for s in status:
+        key = str(s) if s >= 0 else f"err{-s}"
+        hist[key] = hist.get(key, 0) + 1
+    return hist
+
+
+def cpu_busy(cpus, seconds: float = 0.5) -> dict:
+    """Busy % of the given CPUs over a short window (other processes too)."""
+
+    def snap():
+        out = {}
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("cpu") and line[3:4].isdigit():
+                f = line.split()
+                vals = list(map(int, f[1:]))
+                idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+                out[int(f[0][3:])] = (sum(vals), idle)
+        return out
+
+    try:
+        a = snap()
+        time.sleep(seconds)
+        b = snap()
+    except OSError:
+        return {}
+    per = {}
+    for c in cpus:
+        if c in a and c in b:
+            tot = b[c][0] - a[c][0]
+            idle = b[c][1] - a[c][1]
+            per[c] = 100.0 * (tot - idle) / tot if tot > 0 else 0.0
+    if not per:
+        return {}
+    busy = sorted(per.items(), key=lambda kv: -kv[1])
+    return {
+        "mean_pct": sum(per.values()) / len(per),
+        "cpus_over_50pct": [c for c, v in busy if v > 50],
+        "top": [(c, round(v, 1)) for c, v in busy[:8]],
+    }

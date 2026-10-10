@@ -49,6 +49,7 @@ always called outside the timed region.
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import time
 from dataclasses import dataclass, field, replace
@@ -458,31 +459,70 @@ _BATCHGEN = {}
 
 
 def _load_batchgen():
-    if "expert_ffn" not in _BATCHGEN:
+    if "mod" not in _BATCHGEN:
         try:
-            from moe_infinity.kernel.batchgen.expert_ffn import expert_ffn
+            import triton
+
+            from moe_infinity.kernel.batchgen.aot import (
+                SILU_BLOCK_N,
+                SILU_NUM_WARPS,
+            )
+
+            # The package re-exports a function named expert_ffn; import the module.
+            bg = importlib.import_module(
+                "moe_infinity.kernel.batchgen.expert_ffn"
+            )
         except Exception as e:  # noqa: BLE001
             raise KernelUnavailable(
                 f"BatchGen Triton kernels (PR #1) not importable: {e!r}"
             )
-        _BATCHGEN["expert_ffn"] = expert_ffn
-    return _BATCHGEN["expert_ffn"]
+        _BATCHGEN.update(
+            mod=bg,
+            triton=triton,
+            silu_block_n=SILU_BLOCK_N,
+            silu_warps=SILU_NUM_WARPS,
+        )
+    return _BATCHGEN
 
 
 def _bind_batchgen(r: GpuRunner, x):
     """PR #1's vendored BatchGen ``fused_moe_bf16`` Triton kernels, JIT
     compiled by Triton for the running GPU (so sm_120 works; the AOT cubins
-    PR #1 embeds are sm_80/sm_90).  Single-expert form: packed w13 GEMM,
-    ``silu_and_mul``, down GEMM."""
-    expert_ffn = _load_batchgen()
-    w = r.weights
+    PR #1 embeds are sm_80/sm_90).  Same launches as
+    ``moe_infinity.kernel.batchgen.expert_ffn.expert_ffn`` (packed w13 GEMM,
+    ``silu_and_mul``, down GEMM), but config, identity routing and output
+    buffers are built here, once per input shape: expert_ffn builds its
+    routing with a host->device copy every call, which CUDA graphs cannot
+    capture."""
+    bgk = _load_batchgen()
+    bg, triton = bgk["mod"], bgk["triton"]
     if r.meta["activation"] != "silu":
         raise KernelUnavailable("BatchGen expert_ffn implements silu only")
+    w = r.weights
+    rows, k = x.shape
+    n = w["w13"].shape[0] // 2
+    h = w["w2"].shape[0]
+    config = bg.pick_config(rows)
+    routing = bg._identity_routing(rows, config[0], x.device)
+    c1 = torch.empty((rows, 2 * n), device=x.device, dtype=x.dtype)
+    act = torch.empty((rows, n), device=x.device, dtype=x.dtype)
+    out = torch.empty((rows, h), device=x.device, dtype=x.dtype)
+    silu = bg.load_vendor_module()._silu_and_mul_kernel
+    grid = (rows, triton.cdiv(n, bgk["silu_block_n"]))
 
     def fn():
-        w13 = w["w13"]
-        n = w13.shape[0] // 2
-        return expert_ffn(x, w13[:n], w13[n:], w["w2"])
+        bg._gemm(x, w["w13"], c1, routing, rows, 2 * n, k, config, 2 * n)
+        silu[grid](
+            c1,
+            act,
+            n,
+            c1.stride(0),
+            act.stride(0),
+            BLOCK_N=bgk["silu_block_n"],
+            num_warps=bgk["silu_warps"],
+        )
+        bg._gemm(act, w["w2"], out, routing, rows, h, n, config, h)
+        return out
 
     return fn, None
 

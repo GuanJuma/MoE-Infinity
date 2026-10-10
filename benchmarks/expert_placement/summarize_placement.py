@@ -71,9 +71,16 @@ def header(result) -> list:
         f"torch {env['versions'].get('torch')} CUDA {env['versions'].get('torch_cuda')}; "
         f"sglang {env['versions'].get('sglang')}; triton {env['versions'].get('triton')}",
         f"- CPU threads: {cpu.get('torch_threads')} (allowed CPUs {cpu.get('affinity_cpus')}, "
-        f"{cpu.get('Cpus_allowed_list', '-')}; mems {cpu.get('Mems_allowed_list', '-')}); "
+        f"{cpu.get('Cpus_allowed_list', '-')}; cpuset mems {cpu.get('Mems_allowed_list', '-')}; "
+        f"mempolicy {_mempol(env)}); "
         f"ONEDNN_MAX_CPU_ISA={env.get('env', {}).get('ONEDNN_MAX_CPU_ISA', '-')}; "
-        f"amx_selfcheck={_amx(env.get('amx_selfcheck'))}",
+        f"amx_selfcheck={_amx(env.get('amx_selfcheck'))}"
+        + (
+            " (CPU has no AMX: oneDNN AVX512-BF16 path)"
+            if isinstance(cpu.get("isa"), dict)
+            and not cpu["isa"].get("amx_bf16")
+            else ""
+        ),
         f"- flush: {result.get('flush')}; x_std={result.get('x_std'):.4g}",
     ]
     for kind in ("gpu", "cpu"):
@@ -102,6 +109,17 @@ def header(result) -> list:
     for err in result.get("errors", []):
         lines.append(f"- **error** in {err['stage']}: {err['error'][:200]}")
     return lines
+
+
+def _mempol(env):
+    mp = (env.get("host_setup") or {}).get("mempolicy")
+    if mp:
+        return f"{mp.get('mode')} {mp.get('nodes')}"
+    show = env.get("numactl_show") or ""
+    for line in show.splitlines():
+        if line.startswith("membind:"):
+            return "bind " + line.split(":", 1)[1].strip()
+    return "-"
 
 
 def _amx(v):
@@ -149,7 +167,7 @@ def split_tables(result, curves) -> list:
         elif s == "cpu_compute":
             hdr = "| tokens | total | compute (CPU) | of which act quant | overhead | = d2h + h2d | overhead % | TFLOPS | p10-p90 total | err | err vs W8A8 ref |"
         else:
-            hdr = "| tokens | total | compute (kernel) | overhead | = xfer + release + launch | xfer GB/s | overhead % | pipelined max(xfer,compute) | p10-p90 total | err | err vs W8A8 ref |"
+            hdr = "| tokens | total | xfer+kernel (serial) | compute (kernel) | overhead | = xfer + release + launch | xfer GB/s | overhead % | pipelined max(xfer,compute) | p10-p90 total | err | err vs W8A8 ref |"
         lines += [hdr, "|" + "---:|" * (hdr.count("|") - 1)]
         for t in sorted(pts):
             r = pts[t]
@@ -191,6 +209,7 @@ def split_tables(result, curves) -> list:
             else:
                 cells = [
                     _f(r["total_ms"]),
+                    _f(r.get("xfer_plus_kernel_ms")),
                     _f(r["compute_ms"]),
                     _f(r["overhead_ms"]),
                     f"{_f(r['xfer_ms'])} + {_f(r.get('release_ms') or 0)} + {_f(r['launch_ms'])}",
@@ -243,6 +262,14 @@ def crossovers(curves) -> list:
     return lines
 
 
+S3_NOTE = (
+    "S3 note: compare placements on `xfer+kernel`. `raw_pinned` copies asynchronously, "
+    "so its `total` hides the eager call's Python dispatch under the DMA; MoE-Infinity's "
+    "`begin()`/prefetch wait (and `raw_pageable` copies synchronously), so their `total` "
+    "also contains that dispatch (~S1 overhead)."
+)
+
+
 def mi_vs_raw(curves) -> list:
     """MoE-Infinity load path vs the raw cudaMemcpy reference, per kernel."""
     lines = []
@@ -268,6 +295,8 @@ def mi_vs_raw(curves) -> list:
         lines = [
             "",
             "## MoE-Infinity load path vs raw cudaMemcpy (reference)",
+            "",
+            S3_NOTE,
             "",
         ] + lines
     return lines

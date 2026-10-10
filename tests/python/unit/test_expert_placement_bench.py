@@ -441,30 +441,12 @@ def test_bf16_dequant_keeps_per_projection_scales(ckpts):
     assert b.checkpoint_nbytes == 2 * (ew.checkpoint_nbytes - 3 * 4)
 
 
-def test_batchgen_runner_wiring(ckpts, monkeypatch):
-    seen = {}
-
-    def fake_ffn(x, g, u, d):
-        seen["packed"] = (
-            u.data_ptr() == g.data_ptr() + g.numel() * g.element_size()
-        )
-        h = torch.cat(
-            [x.float() @ g.float().t(), x.float() @ u.float().t()], -1
-        )
-        return (runners._act_mul(h, "silu") @ d.float().t()).to(x.dtype)
-
-    monkeypatch.setattr(runners, "_BATCHGEN", {"expert_ffn": fake_ffn})
-    ew = _load(ckpts["hy3_fp8"])
+def test_batchgen_is_bf16_only(ckpts):
+    pytest.importorskip("triton")
     with pytest.raises(runners.KernelUnavailable, match="BF16-only"):
-        runners.build_gpu_runner(ew, "batchgen_triton", "cpu")
-    b = ew.to_bf16()
-    r = runners.build_gpu_runner(b, "batchgen_triton", "cpu")
-    x = _x(9, 256, 0.5)
-    out = r.bind(x)[0]()
-    assert (
-        seen["packed"]
-        and runners.rel_err(out, runners.reference_expert(x, b)) < 0.02
-    )
+        runners.build_gpu_runner(
+            _load(ckpts["hy3_fp8"]), "batchgen_triton", "cpu"
+        )
 
 
 def test_batchgen_triton_interpreter(ckpts, tmp_path):
@@ -481,7 +463,12 @@ def test_batchgen_triton_interpreter(ckpts, tmp_path):
         r.weights = {{k: v.float() for k, v in r.weights.items()}}
         for M in (1, 17):
             x = torch.randn(M, 256) * 0.5
-            err = R.rel_err(r.bind(x)[0](), R.reference_expert(x, ew))
+            fn = r.bind(x)[0]
+            o1 = fn().clone()
+            o2 = fn()
+            assert o2.data_ptr() == fn().data_ptr()  # preallocated: graph-capturable
+            assert torch.equal(o1, o2)
+            err = R.rel_err(o1, R.reference_expert(x, ew))
             assert err < 1e-4, (M, err)
         print("ok")
         """
@@ -900,3 +887,163 @@ def test_broken_store_fails_soft_and_keeps_other_scenarios(
     mi_errs = [e for e in res["errors"] if "+mi_" in e["stage"]]
     assert len(mi_errs) == 2 * 3 and "tensor_to_id_" in mi_errs[0]["error"]
     assert any("MoE-Infinity rows skipped" in w for w in res["warnings"])
+
+
+# -- host setup: NUMA auto-binding and CPU scratch reuse --------------------------
+
+
+def test_numa_plan_binds_unbound_multi_socket_process_to_gpu_node(monkeypatch):
+    env = importlib.import_module("bench_env")
+    # 2 sockets x 4 cores, SMT siblings c and c+8 (like CPUs 0-95,192-287).
+    nodes = {
+        0: set(range(0, 4)) | set(range(8, 12)),
+        1: set(range(4, 8)) | set(range(12, 16)),
+    }
+    monkeypatch.setattr(
+        env, "physical_cores", lambda cpus: sorted(c for c in cpus if c < 8)
+    )
+    plan = env.numa_plan(set(range(16)), nodes, 0)
+    assert (
+        plan["action"] == "bind"
+        and plan["cpus"] == [0, 1, 2, 3]
+        and plan["threads"] == 4
+    )
+    assert (
+        env.numa_plan(nodes[0], nodes, 0)["action"] == "none"
+    )  # already bound (run_sweep.sh)
+    assert env.numa_plan(set(range(16)), nodes, None)["action"] == "warn"
+    assert (
+        env.numa_plan(set(range(4)), {0: set(range(4))}, 0)["action"] == "none"
+    )
+
+
+def test_malloc_reuse_stops_per_call_scratch_faults():
+    if sys.platform != "linux":
+        pytest.skip("glibc only")
+    code = textwrap.dedent(
+        f"""
+        import resource, sys, torch
+        sys.path.insert(0, {str(BENCH)!r})
+        import bench_env
+        if sys.argv[1] == "on":
+            assert bench_env.tune_malloc()["ok"]
+        def faults():
+            f0 = resource.getrusage(resource.RUSAGE_SELF).ru_minflt
+            b = torch.empty(64 << 20, dtype=torch.int8)  # > glibc's 32 MiB mmap threshold
+            b.view(-1, 4096)[:, 0] = 1
+            del b
+            return resource.getrusage(resource.RUSAGE_SELF).ru_minflt - f0
+        faults()
+        print(min(faults() for _ in range(3)))
+        """
+    )
+    got = {}
+    for mode in ("off", "on"):
+        p = subprocess.run(
+            [sys.executable, "-c", code, mode], capture_output=True, text=True
+        )
+        assert p.returncode == 0, p.stderr
+        got[mode] = int(p.stdout.split()[-1])
+    assert got["off"] > 10000 and got["on"] < 100, got
+
+
+def test_prepare_host_records_setup(monkeypatch):
+    args = bench.parse_args(
+        ["--model-dir", "x", "--device", "cpu", "--cpu-threads", "2"]
+    )
+    before = torch.get_num_threads()
+    try:
+        setup, warns = bench.prepare_host(args)
+        assert setup["malloc"]["ok"] and setup["threads"] == 2
+        assert "numa_plan" not in setup  # --device cpu: no GPU node to bind to
+    finally:
+        torch.set_num_threads(before)
+
+
+# -- teardown: never run the native engine's destructors -----------------------------
+
+
+def test_script_exits_without_native_teardown(ckpts, tmp_path):
+    out = tmp_path / "exit"
+    env = dict(
+        os.environ, PYTHONPATH=f"{Path(__file__).resolve().parent}:{REPO}"
+    )
+    p = subprocess.run(
+        [sys.executable, str(BENCH / "expert_placement_bench.py"), "--model-dir", str(ckpts["hy3_fp8"]),
+         "--tokens", "1", "--scenarios", "fetch", "--gpu-kernels", "torch_scaled_mm",
+         "--fetch-modes", "mi_fetch", *COMMON, "--out-dir", str(out)],
+        env=env, capture_output=True, text=True, timeout=600,
+    )  # fmt: skip
+    assert p.returncode == 0, p.stderr[-2000:]
+    res = json.loads((out / "results.json").read_text())
+    assert [r["variant"] for r in res["rows"]] == ["torch_scaled_mm+mi_fetch"]
+    assert "done in" in p.stdout
+    src = (BENCH / "mi_expert_store.py").read_text()
+    assert "def close(self, teardown: bool = False)" in src
+
+
+def test_run_sweep_summarizes_even_if_the_bench_crashes(ckpts, tmp_path):
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "nvidia-smi").write_text(
+        '#!/bin/bash\ncase "$*" in *index*) echo 0;; *memory.used*) echo 3;; '
+        "*pci.bus_id*) echo 00000000:00:04.0;; *) echo stub;; esac\n"
+    )
+    # Run the real interpreter, but die with SIGSEGV after a full benchmark
+    # run (like the native teardown crash), leaving results.json behind.
+    (stub / "python3").write_text(
+        f'#!/bin/bash\n{sys.executable} "$@"; rc=$?\n'
+        'case "$*" in *expert_placement_bench.py*--tokens*) kill -SEGV $$;; esac\nexit $rc\n'
+    )
+    for f in stub.iterdir():
+        f.chmod(0o755)
+    out = tmp_path / "sweep"
+    env = dict(
+        os.environ,
+        PATH=f"{stub}:{os.environ['PATH']}",
+        PYTHONPATH=f"{Path(__file__).resolve().parent}:{REPO}",
+        MODEL_DIR=str(ckpts["hy3_fp8"]), LAYER="1", EXPERT="0", OUT=str(out), TOKENS="1",
+        SCENARIOS="gpu", GPU_KERNELS="torch_scaled_mm", REPEATS="2", SKIP_DRY_RUN="1",
+        REQUIRE_STORE="0",
+    )  # fmt: skip
+    p = subprocess.run(
+        ["bash", str(BENCH / "run_sweep.sh"), "--device", "cpu", "--warmup", "1", "--min-repeats", "1",
+         "--skip-amx-check", "--mi-store-lib", FAKE_MI],
+        env=env, capture_output=True, text=True, timeout=600,
+    )  # fmt: skip
+    assert p.returncode != 0, p.stdout[-1000:]
+    assert "benchmark exited with" in p.stderr
+    assert (out / "results.json").exists() and (
+        out / "summary.md"
+    ).exists(), p.stderr[-2000:]
+
+
+# -- diagnostics -------------------------------------------------------------------
+
+
+def test_cpu_diag_summary_and_serial_s3_column(ckpts, tmp_path):
+    diag = importlib.import_module("summarize_diag")
+    cpu_k = "sglang_fp8_w8a16" if CPU_MOE else "torch_bf16"
+    for variant, extra in (
+        ("base", []),
+        ("no_flush", ["--cpu-llc-flush-mb", "0"]),
+    ):
+        _main_ok(
+            ["--model-dir", str(ckpts["hy3_fp8"]), "--tokens", "1,8", "--scenarios", "cpu,fetch",
+             "--gpu-kernels", "torch_scaled_mm", "--cpu-kernels", cpu_k,
+             "--fetch-modes", "mi_fetch,raw_pinned", *COMMON, *extra],
+            tmp_path / "fp8" / variant,
+        )  # fmt: skip
+    md = diag.render(tmp_path)
+    assert "| variant | threads |" in md and f"### {cpu_k}" in md
+    assert "| M | base | no_flush |" in md
+    res = json.loads((tmp_path / "fp8" / "base" / "results.json").read_text())
+    for r in res["rows"]:
+        assert r["samples_ms"], r["variant"]
+        if r["scenario"] == "cpu_store_gpu_compute":
+            want = r["xfer_ms"] + r["compute_ms"] + (r.get("release_ms") or 0)
+            assert r["xfer_plus_kernel_ms"] == pytest.approx(want)
+    hs = res["env"]["host_setup"]
+    assert "mempolicy" in hs and "host_cpu_busy_before_run" in hs
+    pages = res["setup"]["cpu"][cpu_k]["weight_page_nodes"]
+    assert pages and all(k.isdigit() or k.startswith("err") for k in pages)

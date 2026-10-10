@@ -40,8 +40,8 @@ class _Node:
 
 class prefetch_handle:  # noqa: N801 - mirrors the pybind class name
     def __init__(self, prefix, device_memory_ratio):
-        if INSTANCES and not INSTANCES[-1].closed:
-            raise RuntimeError("MoE-Infinity supports one model per process")
+        # The real engine allows one per process and is never torn down by the
+        # harness; tests build many, so that check is not mirrored here.
         self.prefix = prefix
         self.data = {}
         self.reg = {}

@@ -144,6 +144,7 @@ CSV_FIELDS = [
     "xfer_GBps",
     "compute_TFLOPS",
     "pipelined_ms",
+    "xfer_plus_kernel_ms",
     "repeats",
     "kernel_timing",
     "rel_err",
@@ -227,6 +228,17 @@ def summarize(samples, key):
     if not xs:
         return None, None, None
     return statistics.median(xs), pct(xs, 0.10), pct(xs, 0.90)
+
+
+def _samples(*runs):
+    """Per-repeat timings (JSON only) to spot bimodal / stalled repeats."""
+    out = {}
+    for run in runs:
+        for rep in run:
+            for key, v in rep.items():
+                if isinstance(v, (int, float)):
+                    out.setdefault(key, []).append(round(float(v), 5))
+    return out
 
 
 def run_repeats(one, args, budget_s=None):
@@ -454,6 +466,7 @@ class Bench:
             storage=self.gpu_storage,
             **num,
         )
+        row["samples_ms"] = _samples(sk, se)
         del graph
         return row
 
@@ -498,7 +511,7 @@ class Bench:
         d2h = summarize(s, "d2h")[0]
         h2d = summarize(s, "h2d")[0]
         act_bytes = 2 * M * self.K * x_host.element_size()
-        return self._row(
+        row = self._row(
             "cpu_compute",
             runner.kernel,
             runner.kernel,
@@ -524,6 +537,8 @@ class Bench:
             storage=self.cpu_storage.get(runner.kernel, "torch tensors"),
             **num,
         )
+        row["samples_ms"] = _samples(s)
+        return row
 
     # -- scenario 3 -----------------------------------------------------------
 
@@ -610,6 +625,7 @@ class Bench:
             eager_gpu_span_ms=summarize(se, "span")[0],
             xfer_bytes=nbytes,
             pipelined_ms=max(x50, k50),
+            xfer_plus_kernel_ms=x50 + k50,
             repeats=min(len(sk), len(se)),
             kernel_timing=timing,
             storage=f"torch {host_mem} tensor",
@@ -617,6 +633,7 @@ class Bench:
             numerics="W8A8" if runner.kernel in W8A8_KERNELS else "BF16",
             **num,
         )
+        row["samples_ms"] = _samples(sk, se)
         del graph
         return row
 
@@ -761,6 +778,7 @@ class Bench:
             xfer_bytes=st.nodes[node].nbytes,
             mi_h2d_bytes=moved,
             pipelined_ms=max(x50, k50),
+            xfer_plus_kernel_ms=x50 + k50 + rel50,
             repeats=min(len(sk), len(se)),
             kernel_timing=timing,
             storage="MoE-Infinity pinned host pool (kHostMemoryPool)",
@@ -768,6 +786,7 @@ class Bench:
             numerics="W8A8" if runner.kernel in W8A8_KERNELS else "BF16",
             **num,
         )
+        row["samples_ms"] = _samples(sk, se)
         del graph
         return row
 
@@ -844,6 +863,13 @@ def parse_args(argv=None):
         help="where host-side experts live (S2 weights, S3 source)",
     )
     p.add_argument(
+        "--cpu-weights",
+        default="mi",
+        choices=("mi", "torch"),
+        help="S2 weights in MoE-Infinity's pinned host pool (mi) or plain torch "
+        "tensors (torch; the engine still runs if S3 needs it) -- diagnostic A/B",
+    )
+    p.add_argument(
         "--mi-store-lib", default="moe_infinity._store", help=argparse.SUPPRESS
     )
     p.add_argument("--mi-device-memory-ratio", type=float, default=0.5)
@@ -907,6 +933,19 @@ def parse_args(argv=None):
         type=int,
         default=None,
         help="bind memory to this NUMA node via set_mempolicy (numactl-free alternative)",
+    )
+    p.add_argument(
+        "--numa",
+        default="auto",
+        choices=("auto", "off"),
+        help="auto: if the process is not bound and spans several NUMA nodes, bind "
+        "to the GPU node's physical cores (+ memory) and use that many threads",
+    )
+    p.add_argument(
+        "--malloc-reuse",
+        default="on",
+        choices=("on", "off"),
+        help="on: keep freed CPU kernel scratch mapped (mallopt); off: glibc default",
     )
     p.add_argument("--skip-amx-check", action="store_true")
     p.add_argument("--skip-pcie-probe", action="store_true")
@@ -993,19 +1032,95 @@ def print_inspection(info):
                 print(f"        {t}")
 
 
+def prepare_host(args):
+    """Thread / NUMA / allocator setup; must run before torch starts its
+    thread pool and before any large allocation."""
+    setup, warns = {}, []
+    if args.malloc_reuse == "on":
+        setup["malloc"] = bench_env.tune_malloc()
+        if not setup["malloc"].get("ok"):
+            warns.append(
+                f"mallopt failed ({setup['malloc']}); CPU scratch is re-faulted every call"
+            )
+    explicit = args.cpu_bind or args.membind_node is not None
+    if not explicit and args.numa == "auto" and args.device == "cuda":
+        plan = bench_env.numa_plan(
+            set(os.sched_getaffinity(0)),
+            bench_env.numa_nodes(),
+            bench_env.gpu_numa_node(),
+        )
+        setup["numa_plan"] = plan
+        if plan["action"] == "bind":
+            try:
+                setup["bind"] = bench_env.bind_numa(
+                    ",".join(map(str, plan["cpus"])), plan["gpu_node"]
+                )
+            except OSError as e:
+                setup["bind"] = bench_env.bind_numa(
+                    ",".join(map(str, plan["cpus"])), None
+                )
+                warns.append(
+                    f"memory binding to node {plan['gpu_node']} failed ({e}); CPUs bound only"
+                )
+            if args.cpu_threads <= 0:
+                args.cpu_threads = plan["threads"]
+            warns.append(
+                f"process was not NUMA-bound and spanned nodes {plan['affinity_nodes']}: bound "
+                f"to the GPU's node {plan['gpu_node']} ({plan['threads']} physical cores, memory "
+                f"too) and set {args.cpu_threads} CPU threads. Use run_sweep.sh, --cpu-bind/"
+                f"--membind-node, or --numa off to control this"
+            )
+        elif plan["action"] == "warn":
+            warns.append(
+                f"process spans NUMA nodes {plan['affinity_nodes']} and the GPU's node is unknown: "
+                f"CPU numbers mix sockets. Use run_sweep.sh or --cpu-bind/--membind-node"
+            )
+    elif explicit:
+        setup["bind"] = bench_env.bind_numa(args.cpu_bind, args.membind_node)
+    if setup.get("bind"):
+        print(f"NUMA binding: {setup['bind']}")
+    if args.cpu_threads > 0:
+        torch.set_num_threads(args.cpu_threads)
+    allowed = os.sched_getaffinity(0)
+    phys = bench_env.physical_cores(allowed)
+    nodes = bench_env.numa_nodes()
+    spanned = sorted(n for n, c in nodes.items() if c & allowed)
+    setup["mempolicy"] = bench_env.mempolicy()
+    setup["host_cpu_busy_before_run"] = bench_env.cpu_busy(sorted(allowed))
+    busy = setup["host_cpu_busy_before_run"].get("cpus_over_50pct") or []
+    if busy:
+        warns.append(
+            f"{len(busy)} of the allowed CPUs are >50% busy before the run (other "
+            f"processes?): {busy[:16]} -- CPU timings will include time-slice stalls"
+        )
+    setup["threads"] = torch.get_num_threads()
+    setup["allowed_cpus"] = len(allowed)
+    setup["allowed_physical_cores"] = len(phys)
+    setup["allowed_numa_nodes"] = spanned
+    if torch.get_num_threads() > len(phys):
+        warns.append(
+            f"{torch.get_num_threads()} CPU threads > {len(phys)} allowed physical cores "
+            f"(SMT siblings or oversubscription)"
+        )
+    if len(spanned) > 1:
+        warns.append(
+            f"CPU threads span NUMA nodes {spanned}: S2 numbers include cross-socket traffic"
+        )
+    for w in warns:
+        print("!" * 78 + f"\nWARNING: {w}\n" + "!" * 78, flush=True)
+    return setup, warns
+
+
 def run(args) -> int:
     t_start = time.perf_counter()
-    numa_bind = bench_env.bind_numa(args.cpu_bind, args.membind_node)
-    if numa_bind:
-        print(f"in-process NUMA binding: {numa_bind}")
+    host_setup, setup_warnings = prepare_host(args)
+    numa_bind = host_setup.get("bind")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise KernelUnavailable(
             "CUDA not available (no GPU visible). Check `docker run --gpus` and "
             "CUDA_VISIBLE_DEVICES; --device cpu runs a debug-only CPU emulation."
         )
-    if args.cpu_threads > 0:
-        torch.set_num_threads(args.cpu_threads)
     scenarios = []
     for s in args.scenarios.split(","):
         s = s.strip()
@@ -1050,7 +1165,8 @@ def run(args) -> int:
 
     env = bench_env.collect(out_dir, device, args.cpu_threads)
     env["numa_bind"] = numa_bind or None
-    warnings = []
+    env["host_setup"] = host_setup
+    warnings = list(setup_warnings)
     if device.type == "cpu":
         warnings.append(
             "--device cpu: GPU scenarios emulated on CPU; timings are NOT meaningful"
@@ -1242,11 +1358,14 @@ def run(args) -> int:
                 nodes[f"other:{k}"] = {
                     n: t.clone() for n, t in nodes[f"gpu:{k}"].items()
                 }
-        for k, r in cpu_runners.items():
-            nodes[f"cpu:{k}"] = dict(r.tensors)
-        if len(nodes) == 1:
-            nodes["other:pad"] = {
-                n: t.clone() for n, t in next(iter(nodes.values())).items()
+        if args.cpu_weights == "mi":
+            for k, r in cpu_runners.items():
+                nodes[f"cpu:{k}"] = dict(r.tensors)
+        while len(nodes) < 2:
+            # A sparse stage needs two nodes; with --cpu-weights torch and no S3
+            # this keeps the engine (and its threads) alive for the A/B.
+            nodes[f"pad:{len(nodes)}"] = {
+                "w": torch.zeros(1 << 20, dtype=torch.uint8)
             }
         try:
             store = mi_expert_store.MoEInfinityExpertStore(
@@ -1259,6 +1378,8 @@ def run(args) -> int:
             )
             bench.store = store
             for k, r in cpu_runners.items():
+                if f"cpu:{k}" not in store.nodes:
+                    continue
                 r.tensors = store.tensors(f"cpu:{k}")
                 bench.cpu_storage[k] = (
                     "MoE-Infinity pinned host pool (kHostMemoryPool)"
@@ -1299,6 +1420,20 @@ def run(args) -> int:
             result["errors"].append({"stage": "mi_store", "error": repr(e)})
             result["warnings"].append(msg)
             print(f"WARNING: {msg}", flush=True)
+
+    for k, r in cpu_runners.items():
+        result["setup"]["cpu"][k]["weight_page_nodes"] = bench_env.page_nodes(
+            r.tensors["w13"]
+        )
+        result["setup"]["cpu"][k]["weight_storage"] = bench.cpu_storage.get(k)
+    if cpu_runners:
+        print(
+            "CPU weight pages by NUMA node: "
+            + ", ".join(
+                f"{k} {v['weight_page_nodes']}"
+                for k, v in result["setup"]["cpu"].items()
+            )
+        )
 
     def guard(stage, f, *a):
         try:
@@ -1456,6 +1591,11 @@ DEFINITIONS = {
         "total_ms": "host wall time of move + eager expert call + sync (+ release for mi_*)",
         "overhead_ms": "total - compute (= xfer + release + launch_ms)",
         "pipelined_ms": "max(xfer, compute): lower bound if the move is fully prefetched/overlapped",
+        "xfer_plus_kernel_ms": "xfer + compute (+ release): serial cost without host-side "
+        "overlap. raw_pinned's copy is asynchronous, so its total hides the Python "
+        "dispatch of the eager call under the DMA; MoE-Infinity's begin() and raw_pageable "
+        "return only after the copy, so their total adds that dispatch. Compare rows on "
+        "this column",
     },
     "rel_err": "vs FP32 reference with dequantized weights and unquantized activations",
     "rel_err_w8a8": "W8A8 kernels only: vs FP32 reference with the same FP8 weights and "
@@ -1468,4 +1608,8 @@ DEFINITIONS = {
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    if mi_expert_store.LIVE_ENGINES:
+        # Outputs are written; skip native teardown (see mi_expert_store).
+        mi_expert_store.exit_process(rc)
+    sys.exit(rc)
