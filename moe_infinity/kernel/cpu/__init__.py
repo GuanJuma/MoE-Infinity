@@ -12,6 +12,7 @@ from .expert_ffn import (
     dequant_fp8_block,
     fused_experts,
     pack_experts,
+    pack_fp8_experts,
     reference_experts,
 )
 
@@ -26,5 +27,6 @@ __all__ = [
     "is_available",
     "load_cpu_moe",
     "pack_experts",
+    "pack_fp8_experts",
     "reference_experts",
 ]

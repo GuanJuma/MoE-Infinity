@@ -24,6 +24,7 @@ from moe_infinity.kernel.cpu import (  # noqa: E402
     dequant_fp8_block,
     fused_experts,
     pack_experts,
+    pack_fp8_experts,
     reference_experts,
 )
 from moe_infinity.kernel.cpu.expert_ffn import (  # noqa: E402
@@ -86,6 +87,48 @@ def test_fp8_w8a16_matches_dequantized_reference(M):
         tw,
     )
     assert _rel(fused_experts(x, packed, ids, tw), ref) < 1e-2
+
+
+@pytest.mark.parametrize("M", [1, 9, 40])
+def test_prequantized_fp8_matches_pack_experts(M):
+    x, w13, w2, ids, tw = _problem(M, E=4, K=256, N=128, topk=2, seed=3)
+    q13, s13 = _quant_fp8_block(w13, (128, 128))
+    q2, s2 = _quant_fp8_block(w2, (128, 128))
+    packed = pack_fp8_experts(q13, q2, s13, s2, (128, 128))
+    ref = fused_experts(
+        x, pack_experts(w13, w2, CpuExpertQuant.FP8_W8A16), ids, tw
+    )
+    assert torch.equal(fused_experts(x, packed, ids, tw), ref)
+
+
+def test_prequantized_fp8_per_tensor_scales_broadcast():
+    x, w13, w2, ids, tw = _problem(5, E=2, K=256, N=128, topk=1, seed=4)
+    s13 = torch.tensor([0.01, 0.02]).view(2, 1, 1)
+    s2 = torch.tensor([0.03, 0.04]).view(2, 1, 1)
+    q13 = (w13.float() / s13).to(torch.float8_e4m3fn)
+    q2 = (w2.float() / s2).to(torch.float8_e4m3fn)
+    packed = pack_fp8_experts(
+        q13, q2, s13.expand(2, 2, 2), s2.expand(2, 2, 1), (128, 128)
+    )
+    ref = reference_experts(x, q13.float() * s13, q2.float() * s2, ids, tw)
+    assert _rel(fused_experts(x, packed, ids, tw), ref) < 1e-2
+    with pytest.raises(ValueError, match="block scales"):
+        pack_fp8_experts(
+            q13, q2, s13.expand(2, 2, 1), s2.expand(2, 2, 1), (128, 128)
+        )
+    with pytest.raises(ValueError, match="float8_e4m3fn"):
+        pack_fp8_experts(w13, q2, s13, s2, (128, 128))
+
+
+def test_inplace_writes_into_hidden_states():
+    x, w13, w2, ids, tw = _problem(6, E=4, K=256, N=128, topk=2)
+    packed = pack_experts(w13, w2, "bf16")
+    ref = fused_experts(x, packed, ids, tw)
+    buf = x.clone()
+    out = fused_experts(buf, packed, ids, tw, inplace=True)
+    assert out.data_ptr() == buf.data_ptr() and torch.equal(buf, ref)
+    with pytest.raises(ValueError):
+        fused_experts(x.float(), packed, ids, tw, inplace=True)
 
 
 def test_packed_bf16_is_same_size_as_input():

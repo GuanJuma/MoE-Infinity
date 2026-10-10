@@ -145,26 +145,90 @@ def pack_experts(
     )
 
 
+def pack_fp8_experts(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    block_size: Sequence[int],
+    activation: str = "silu",
+) -> PackedCpuExperts:
+    """Prepack already-quantized e4m3 experts (e.g. an FP8 checkpoint).
+
+    ``w13``: ``[E, 2N, K]``, ``w2``: ``[E, K, N]``, both ``float8_e4m3fn``.
+    Scales are dequantization multipliers per ``block_size = (bn, bk)``
+    block: ``[E, ceil(2N/bn), ceil(K/bk)]`` and ``[E, ceil(K/bn), ceil(N/bk)]``.
+    Per-tensor checkpoint scales can be expressed by broadcasting them over
+    the block grid (gate and up need ``N % bn == 0`` to keep their own scale).
+    """
+    ops = load_cpu_moe()
+    if w13.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"expected float8_e4m3fn weights, got {w13.dtype} / {w2.dtype}"
+        )
+    if w13.dim() != 3 or w2.dim() != 3:
+        raise ValueError("w13 and w2 must be [E, OC, IC]")
+    E, two_n, K = w13.shape
+    N = two_n // 2
+    if w2.shape != (E, K, N):
+        raise ValueError(
+            f"w2 shape {tuple(w2.shape)} != expected {(E, K, N)} for w13 "
+            f"{tuple(w13.shape)}"
+        )
+    bn, bk = (int(b) for b in block_size)
+    want13 = (E, math.ceil(two_n / bn), math.ceil(K / bk))
+    want2 = (E, math.ceil(K / bn), math.ceil(N / bk))
+    if tuple(w13_scale.shape) != want13 or tuple(w2_scale.shape) != want2:
+        raise ValueError(
+            f"block scales {tuple(w13_scale.shape)} / {tuple(w2_scale.shape)} "
+            f"do not match block_size {(bn, bk)}: expected {want13} / {want2}"
+        )
+    return PackedCpuExperts(
+        w13=ops.convert_weight_packed(w13.contiguous()),
+        w2=ops.convert_weight_packed(w2.contiguous()),
+        quant=CpuExpertQuant.FP8_W8A16,
+        num_experts=E,
+        hidden_size=K,
+        intermediate_size=N,
+        activation=activation,
+        w13_scale=w13_scale.to(torch.float32).contiguous(),
+        w2_scale=w2_scale.to(torch.float32).contiguous(),
+        block_size=[bn, bk],
+    )
+
+
 def fused_experts(
     hidden_states: torch.Tensor,
     packed: PackedCpuExperts,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
+    inplace: bool = False,
 ) -> torch.Tensor:
     """``sum_k w[t,k] * expert[ids[t,k]](x[t])`` for every token, in BF16.
 
     ``topk_ids`` index into ``packed`` (``0 .. E-1``); every slot must be a
-    valid local expert.
+    valid local expert.  ``inplace=True`` writes the result into
+    ``hidden_states``, which must then already be a contiguous BF16 tensor.
     """
     ops = load_cpu_moe()
-    x = hidden_states.to(torch.bfloat16).contiguous()
+    if inplace:
+        if (
+            hidden_states.dtype != torch.bfloat16
+            or not hidden_states.is_contiguous()
+        ):
+            raise ValueError(
+                "inplace fused_experts needs contiguous bf16 hidden_states"
+            )
+        x = hidden_states
+    else:
+        x = hidden_states.to(torch.bfloat16).contiguous()
     return ops.fused_experts_cpu(
         x,
         packed.w13,
         packed.w2,
         topk_weights.to(torch.float32).contiguous(),
         topk_ids.to(torch.int32).contiguous(),
-        False,
+        inplace,
         packed.quant.comp_method,
         packed.w13_scale,
         packed.w2_scale,
