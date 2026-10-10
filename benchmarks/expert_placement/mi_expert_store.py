@@ -70,6 +70,25 @@ USED_BINDINGS = (
 )
 
 
+# Native engines started in this process.  ArcherTaskPool's destructor
+# (core/prefetch/task_scheduler.h) sets its stop flag and *detaches* its GPU
+# threads, then frees itself while they may still be in GPUThreadFunc, so
+# tearing the engine down (clean_up_resources, or static destructors at
+# interpreter exit) can segfault.  OffloadEngine never tears down; callers
+# that started an engine should write their outputs and leave with
+# ``exit_process`` (os._exit), as benchmarks/mxfp4_benchmark.py does.
+LIVE_ENGINES = 0
+
+
+def exit_process(code: int) -> None:
+    """Flush and leave without running native destructors."""
+    import sys
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 class StoreUnavailable(RuntimeError):
     pass
 
@@ -120,6 +139,8 @@ class MoEInfinityExpertStore:
         self.device_id = device_id
         t0 = time.perf_counter()
         self.h = self.lib.prefetch_handle(str(self.dir), device_memory_ratio)
+        global LIVE_ENGINES
+        LIVE_ENGINES += 1
         self.nodes: Dict[str, NodeHandle] = {}
         # Python mirror of ArcherTensorHandle::tensor_to_id_ (data_ptr -> id).
         self._ptr_ids: Dict[int, int] = {}
@@ -251,9 +272,12 @@ class MoEInfinityExpertStore:
         if "committed" not in r:
             raise RuntimeError(f"expert cache resize rejected: {r}")
 
-    def close(self):
+    def close(self, teardown: bool = False):
+        """Remove the offload files.  The engine itself is left running unless
+        ``teardown`` (see LIVE_ENGINES: native teardown can segfault)."""
         try:
-            self.h.clean_up_resources()
+            if teardown:
+                self.h.clean_up_resources()
         finally:
             if not self.keep_dir:
                 shutil.rmtree(self.dir, ignore_errors=True)

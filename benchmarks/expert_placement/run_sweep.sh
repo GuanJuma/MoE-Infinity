@@ -9,7 +9,8 @@
 #
 # Env knobs: MODEL_DIR LAYER EXPERT PRECISION (fp8|bf16) OUT TOKENS SCENARIOS
 #            GPU_KERNELS CPU_KERNELS FETCH_MODES REPEATS CPU_THREADS
-#            NUMA_NODE (auto) SKIP_DRY_RUN=1 IDLE_MIB
+#            NUMA_NODE (auto) SKIP_DRY_RUN=1 IDLE_MIB REQUIRE_STORE=0 (--expert-store torch)
+#            EXCLUDE_CPUS (e.g. 0-7) OUT_OWNER (uid:gid for the outputs; default: repo owner)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -30,7 +31,7 @@ export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/scratch/torch_extensions}"
 mkdir -p "$OUT"
 
-if ! python3 -c "import torch, moe_infinity._store" 2>/dev/null; then
+if [ "${REQUIRE_STORE:-1}" = "1" ] && ! python3 -c "import torch, moe_infinity._store" 2>/dev/null; then
     echo "ERROR: moe_infinity._store is not built; S2/S3 need MoE-Infinity's expert store." >&2
     echo "       Build it: python3 $BENCH/build_extensions.py (see the guide)" >&2
     exit 4
@@ -76,6 +77,23 @@ for c in expand(sys.argv[1]):
 print(",".join(map(str, keep)))
 EOF
 )
+if [ -n "${EXCLUDE_CPUS:-}" ]; then
+    # e.g. EXCLUDE_CPUS=0-7: keep OpenMP off the cores the MoE-Infinity engine's
+    # task-pool threads are pinned to (task_thread.cpp: CPU 1, 2, ...).
+    phys=$(python3 - "$phys" "$EXCLUDE_CPUS" <<'PYEOF'
+import sys
+def expand(s):
+    out = set()
+    for part in s.split(","):
+        if part.strip():
+            a, _, b = part.partition("-")
+            out.update(range(int(a), int(b or a) + 1))
+    return out
+keep = [c for c in map(int, sys.argv[1].split(",")) if c not in expand(sys.argv[2])]
+print(",".join(map(str, keep)))
+PYEOF
+)
+fi
 n_phys=$(echo "$phys" | tr ',' '\n' | wc -l)
 CPU_THREADS="${CPU_THREADS:-$n_phys}"
 export OMP_NUM_THREADS="$CPU_THREADS"
@@ -98,15 +116,37 @@ RUNARGS=("${COMMON[@]}" "${PYBIND[@]}")
 cd "$REPO"
 python3 "$BENCH/expert_placement_bench.py" "${COMMON[@]}" --list-experts | tee "$OUT/list_experts.txt"
 if [ "${SKIP_DRY_RUN:-0}" != "1" ]; then
+    set +e
     "${BIND[@]}" python3 "$BENCH/expert_placement_bench.py" "${RUNARGS[@]}" --dry-run \
         --scenarios "$SCENARIOS" --gpu-kernels "$GPU_KERNELS" --cpu-kernels "$CPU_KERNELS" \
         --out-dir "$OUT/dry_run" "$@" 2>&1 | tee "$OUT/dry_run.log"
+    dry_rc=${PIPESTATUS[0]}
+    set -e
+    [ "$dry_rc" -eq 0 ] || echo "WARNING: dry-run exited with $dry_rc (see $OUT/dry_run.log); continuing" >&2
 fi
+set +e
 "${BIND[@]}" python3 "$BENCH/expert_placement_bench.py" "${RUNARGS[@]}" \
     --tokens "$TOKENS" --scenarios "$SCENARIOS" --gpu-kernels "$GPU_KERNELS" \
     --cpu-kernels "$CPU_KERNELS" --repeats "$REPEATS" --idle-mib "$IDLE_MIB" \
     --out-dir "$OUT" "$@" 2>&1 | tee "$OUT/run.log"
-# Plots need matplotlib; without it the summary is Markdown only (plot the
-# CSV/JSON locally with the same script).
-python3 "$BENCH/summarize_placement.py" "$OUT" > /dev/null || true
-echo "results: $OUT/{results.csv,results.json,summary.md,*.png}"
+rc=${PIPESTATUS[0]}
+set -e
+[ "$rc" -eq 0 ] || echo "WARNING: benchmark exited with $rc (see $OUT/run.log)" >&2
+# Results are written after every row, so summarize whatever exists even if
+# the run ended badly.  Plots need matplotlib; without it the summary is
+# Markdown only (plot the CSV/JSON locally with the same script).
+if [ -f "$OUT/results.json" ]; then
+    python3 "$BENCH/summarize_placement.py" "$OUT" > /dev/null || echo "WARNING: summary failed" >&2
+    echo "results: $OUT/{results.csv,results.json,summary.md,*.png}"
+else
+    echo "ERROR: no $OUT/results.json" >&2
+fi
+# Outputs are created as root inside the container; hand them to the owner of
+# the repo checkout (the host user) so they can be read/moved/tarred outside.
+if [ "$(id -u)" = "0" ]; then
+    owner="${OUT_OWNER:-$(stat -c %u:%g "$REPO")}"
+    if [ "$owner" != "0:0" ]; then
+        chown -R "$owner" "$OUT" "$(dirname "$OUT")" 2>/dev/null || true
+    fi
+fi
+exit "$rc"
