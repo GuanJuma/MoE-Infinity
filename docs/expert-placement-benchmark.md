@@ -153,6 +153,17 @@ source <bundle>/env.sh
 - Without matplotlib, the summary is Markdown only. Run the same
   `summarize_placement.py` locally to plot from the CSV/JSON.
 
+## CPU diagnostics, host setup and teardown
+
+| Topic | Behaviour |
+| --- | --- |
+| Host setup | `--numa auto` (default): if the process isn't bound and spans several NUMA nodes, it binds to the GPU node's physical cores and memory. |
+| Allocator | `--malloc-reuse on` (default): keeps the CPU FP8 kernels' per-call scratch (`threads × 1 MiB`) mapped instead of re-faulting it on every call. |
+| Recorded facts | Every run stores the real `mempolicy`, the NUMA node of the weight pages, host CPU busy %, and per-repeat samples (`samples_ms`). |
+| `cpu_diag.sh` | Runs one S2-only variant per hypothesis and tabulates them with `summarize_diag.py`. Variants cover: weights in the pinned pool vs torch tensors; engine alive vs absent; OMP bind and wait policy; no flush; fewer threads; excluding CPUs 0–7 (the engine's task-pool threads are pinned there); malloc off; oneDNN ISA; and `ONEDNN_VERBOSE` brgemm aggregation. |
+| S3 comparison | Compare rows on `xfer_plus_kernel_ms`. `raw_pinned` copies asynchronously, so the eager call's Python dispatch overlaps the DMA. MoE-Infinity's `begin()` returns only once the expert is resident, as does `raw_pageable`. |
+| Teardown | `ArcherTaskPool`'s destructor detaches its GPU threads and then frees itself, which can segfault at exit. The harness therefore never tears the engine down and leaves via `os._exit` after writing all outputs. `run_sweep.sh` summarizes whenever `results.json` exists and chowns root-created outputs to the repo owner. |
+
 ## Usage
 
 ```bash
