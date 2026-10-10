@@ -27,7 +27,11 @@ Per-scenario split (all medians over repeats, milliseconds):
                pure device time without launch gaps
     total    = host wall time of one eager call, inputs already on the GPU,
                from the call to torch.cuda.synchronize() returning
-    overhead = total - compute  (Python dispatch, kernel launches, sync)
+    overhead = exposed overhead = total - compute: the part of host dispatch,
+               launches and sync the GPU does not hide.  host_dispatch (call
+               returns, no sync) stays ~constant; while it outlasts the kernels
+               it is all exposed, at large M it overlaps GPU execution
+               (hidden_dispatch = dispatch - exposed)
   cpu_compute   (hidden states start on the GPU, result must end there)
     d2h      = activations GPU -> pinned host buffer + stream sync
     compute  = CPU kernel wall time (result written in place into the
@@ -75,12 +79,15 @@ import time
 import traceback
 from dataclasses import replace
 from pathlib import Path
+from typing import Optional
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(1, str(HERE.parents[1]))
 
 import bench_env  # noqa: E402
+import cpu_layout  # noqa: E402
+import isolation  # noqa: E402
 import mi_expert_store  # noqa: E402
 import torch  # noqa: E402
 from checkpoint_expert import (  # noqa: E402
@@ -145,6 +152,16 @@ CSV_FIELDS = [
     "compute_TFLOPS",
     "pipelined_ms",
     "xfer_plus_kernel_ms",
+    "host_dispatch_ms",
+    "exposed_overhead_ms",
+    "hidden_dispatch_ms",
+    "launches_per_call",
+    "interfered",
+    "attempts",
+    "foreign_max_pct",
+    "run_delay_max_ms",
+    "nonvol_switches",
+    "migrations",
     "repeats",
     "kernel_timing",
     "rel_err",
@@ -285,6 +302,51 @@ def try_graph(fn, reset, clock: Clock, mode: str):
     except Exception as e:  # noqa: BLE001
         torch.cuda.synchronize()
         return None, f"eager_events (graph capture failed: {type(e).__name__})"
+
+
+_CU_NODE_TYPES = {0: "kernel", 1: "memcpy", 2: "memset"}
+
+
+def cuda_graph_node_types(handle, lib=None) -> dict:
+    """Node counts of a captured cudaGraph_t, by type (CUDA driver API)."""
+    import ctypes
+
+    lib = lib or ctypes.CDLL("libcuda.so.1")
+    n = ctypes.c_size_t(0)
+    g = ctypes.c_void_p(handle)
+    if lib.cuGraphGetNodes(g, None, ctypes.byref(n)) != 0:
+        raise RuntimeError("cuGraphGetNodes failed")
+    nodes = (ctypes.c_void_p * max(1, n.value))()
+    if n.value and lib.cuGraphGetNodes(g, nodes, ctypes.byref(n)) != 0:
+        raise RuntimeError("cuGraphGetNodes failed")
+    out = {"kernel": 0, "memcpy": 0, "memset": 0, "other": 0}
+    t = ctypes.c_int(0)
+    for i in range(n.value):
+        if (
+            lib.cuGraphNodeGetType(ctypes.c_void_p(nodes[i]), ctypes.byref(t))
+            != 0
+        ):
+            raise RuntimeError("cuGraphNodeGetType failed")
+        out[_CU_NODE_TYPES.get(t.value, "other")] += 1
+    return out
+
+
+def graph_node_counts(fn, reset) -> Optional[dict]:
+    """Launches per call: capture one more (never replayed) graph of ``fn``
+    and count its nodes, so the timed graph and the eager path are untouched."""
+    try:
+        g = torch.cuda.CUDAGraph(keep_graph=True)
+        if reset:
+            reset()
+        with torch.cuda.graph(g):
+            fn()
+        torch.cuda.synchronize()
+        out = cuda_graph_node_types(g.raw_cuda_graph())
+        del g
+        return out
+    except Exception:  # noqa: BLE001
+        torch.cuda.synchronize()
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -432,10 +494,12 @@ class Bench:
             t0 = time.perf_counter()
             e0.record()
             fn()
+            td = time.perf_counter()
             e1.record()
             c.sync()
             return {
                 "total": (time.perf_counter() - t0) * 1e3,
+                "dispatch": (td - t0) * 1e3,
                 "span": e0.elapsed_time(e1),
             }
 
@@ -443,6 +507,8 @@ class Bench:
         se = run_repeats(it_eager, self.args)
         k50, k10, k90 = summarize(sk, "kernel")
         t50, t10, t90 = summarize(se, "total")
+        disp = summarize(se, "dispatch")[0]
+        nodes = graph_node_counts(fn, reset) if graph is not None else None
         row = self._row(
             "gpu_resident",
             runner.kernel,
@@ -453,6 +519,10 @@ class Bench:
             compute_ms=k50,
             overhead_ms=t50 - k50,
             launch_ms=t50 - k50,
+            host_dispatch_ms=disp,
+            exposed_overhead_ms=t50 - k50,
+            hidden_dispatch_ms=max(0.0, disp - (t50 - k50)),
+            launches_per_call=(nodes or {}).get("kernel"),
             total_p10_ms=t10,
             total_p90_ms=t90,
             compute_p10_ms=k10,
@@ -467,6 +537,8 @@ class Bench:
             **num,
         )
         row["samples_ms"] = _samples(sk, se)
+        if nodes:
+            row["graph_nodes"] = nodes
         del graph
         return row
 
@@ -954,6 +1026,74 @@ def parse_args(argv=None):
         choices=("on", "off"),
         help="on: keep freed CPU kernel scratch mapped (mallopt); off: glibc default",
     )
+    g = p.add_argument_group(
+        "CPU isolation and interference (run_sweep.sh: ISOLATE=1, see the guide)"
+    )
+    g.add_argument(
+        "--isolate",
+        default="none",
+        choices=("none", "soft"),
+        help="direct runs: soft = OpenMP workers on the GPU node's cores minus "
+        "--housekeeping-cpus (SMT siblings idle), everything else of ours on the "
+        "housekeeping CPUs; nothing outside this process is changed",
+    )
+    g.add_argument("--housekeeping-cpus", default="0-7")
+    g.add_argument(
+        "--main-thread",
+        default="housekeeping",
+        choices=cpu_layout.MAIN_MODES,
+        help="housekeeping: the main thread (OpenMP master) is bound to the "
+        "housekeeping set; compute: it is the first compute place",
+    )
+    g.add_argument(
+        "--compute-cores",
+        default=None,
+        help="direct runs: explicit core list instead of the GPU node's cores",
+    )
+    g.add_argument(
+        "--engine-cpus",
+        default=None,
+        help="CPUs for MoE-Infinity's task-pool/AIO threads (default: housekeeping)",
+    )
+    g.add_argument(
+        "--monitor",
+        default="auto",
+        choices=("auto", "on", "off"),
+        help="background foreign-load sampler (auto = on under isolation, where it "
+        "runs on the housekeeping CPUs)",
+    )
+    g.add_argument("--monitor-interval", type=float, default=0.2)
+    g.add_argument(
+        "--noise-check-s",
+        type=float,
+        default=0.0,
+        help="pre-run foreign-load check on the compute CPUs (run_sweep.sh: 10)",
+    )
+    g.add_argument("--noise-warn-pct", type=float, default=5.0)
+    g.add_argument(
+        "--noise-abort-pct",
+        type=float,
+        default=0.0,
+        help="abort if a compute CPU's mean foreign load exceeds this (0 = never)",
+    )
+    g.add_argument(
+        "--interference-delay-ms",
+        type=float,
+        default=1.0,
+        help="flag a row if a compute (S2) or main thread waited this long on the run queue",
+    )
+    g.add_argument(
+        "--interference-foreign-pct",
+        type=float,
+        default=20.0,
+        help="flag an S2 row if a compute CPU or its SMT sibling had this much foreign load",
+    )
+    g.add_argument(
+        "--retry-interfered",
+        type=int,
+        default=0,
+        help="re-measure flagged S2 rows up to N times",
+    )
     p.add_argument("--skip-amx-check", action="store_true")
     p.add_argument("--skip-pcie-probe", action="store_true")
     p.add_argument(
@@ -1084,8 +1224,16 @@ def prepare_host(args):
             )
     elif explicit:
         setup["bind"] = bench_env.bind_numa(args.cpu_bind, args.membind_node)
+    first = bench_env.first_place() if bench_env.omp_pinned() else None
+    if setup.get("bind", {}).get("cpus") and first:
+        # sched_setaffinity(0) above replaced libgomp's binding of this (master)
+        # thread to its place; put it back.
+        os.sched_setaffinity(0, first)
     if setup.get("bind"):
         print(f"NUMA binding: {setup['bind']}")
+    if cpu_layout.from_env(os.environ) and os.environ.get("OMP_NUM_THREADS"):
+        # one place per thread, the housekeeping place included
+        args.cpu_threads = int(os.environ["OMP_NUM_THREADS"])
     if args.cpu_threads > 0:
         torch.set_num_threads(args.cpu_threads)
     pinned = bench_env.omp_pinned()
@@ -1366,6 +1514,8 @@ def run(args) -> int:
     bench.gpu_storage = "GPU memory (torch tensors)"
     bench.cpu_storage = {k: "torch host tensors" for k in cpu_runners}
     mi_runners = {}
+    iso = isolation.Isolation(args, out_dir)
+    iso.before_engine()
     want_mi = args.expert_store == "moe_infinity" and (
         want_cpu
         or (want_fetch and any(m.startswith("mi_") for m in fetch_modes))
@@ -1443,6 +1593,31 @@ def run(args) -> int:
             result["warnings"].append(msg)
             print(f"WARNING: {msg}", flush=True)
 
+    iso.after_engine()
+    result["env"]["isolation"] = iso.describe()
+    print(f"CPU layout: {iso.describe()}", flush=True)
+    if args.noise_check_s > 0:
+        rep = iso.noise_check(args.noise_check_s)
+        result["noise_check"] = rep
+        worst = rep.get("foreign_mean_max_pct", 0.0)
+        if args.noise_abort_pct > 0 and worst > args.noise_abort_pct:
+            msg = (
+                f"noise check: foreign load {worst}% (mean over {args.noise_check_s:g} s) "
+                f"on compute CPU {rep.get('busiest_cpus', [[None]])[0][0]} > "
+                f"--noise-abort-pct {args.noise_abort_pct:g}; not measuring"
+            )
+            result["errors"].append({"stage": "noise_check", "error": msg})
+            write_outputs(out_dir, result)
+            raise KernelUnavailable(msg)
+        if worst > args.noise_warn_pct or rep.get("foreign_max_pct", 0) > 50:
+            msg = (
+                f"noise check: foreign load on the compute CPUs (mean max {worst}%, "
+                f"worst window {rep.get('foreign_max_pct')}%); see noise_check in results.json"
+            )
+            result["warnings"].append(msg)
+            print(f"WARNING: {msg}", flush=True)
+    iso.start_monitor()
+
     for k, r in cpu_runners.items():
         result["setup"]["cpu"][k]["weight_page_nodes"] = bench_env.page_nodes(
             r.tensors["w13"]
@@ -1457,9 +1632,58 @@ def run(args) -> int:
             )
         )
 
+    def measure(stage, f, *a):
+        """One row, with interference accounting; flagged CPU-scenario rows
+        are re-measured up to --retry-interfered times (first clean attempt
+        wins, otherwise the fastest)."""
+        attempts = []
+        for i in range(1 + max(0, args.retry_interfered)):
+            tok = iso.row_begin()
+            row = f(*a)
+            m = iso.row_end(tok, row["scenario"])
+            row["interference"] = m
+            attempts.append(row)
+            if not m["interfered"] or row["scenario"] != "cpu_compute":
+                break
+            if i < args.retry_interfered:
+                print(
+                    f"  interference in {stage} ({'; '.join(m['reasons'])}): retry {i + 1}",
+                    flush=True,
+                )
+        clean = [r for r in attempts if not r["interference"]["interfered"]]
+        row = clean[0] if clean else min(attempts, key=lambda r: r["total_ms"])
+        im_ = row["interference"]
+        im_["attempts"] = [
+            {
+                "total_ms": r["total_ms"],
+                "compute_ms": r["compute_ms"],
+                "interfered": r["interference"]["interfered"],
+                "reasons": r["interference"]["reasons"],
+            }
+            for r in attempts
+        ]
+        f_ = im_.get("foreign") or {}
+        row.update(
+            interfered=im_["interfered"],
+            attempts=len(attempts),
+            foreign_max_pct=f_.get("foreign_max_pct"),
+            run_delay_max_ms=im_["compute"]["run_delay_max_ms"]
+            if row["scenario"] == "cpu_compute"
+            else im_["main"]["run_delay_max_ms"],
+            nonvol_switches=im_["compute"]["nonvol_switches"]
+            + im_["main"]["nonvol_switches"],
+            migrations=im_["compute"]["migrations"],
+        )
+        if im_["interfered"]:
+            print(
+                f"  INTERFERENCE {stage}: {'; '.join(im_['reasons'])}",
+                flush=True,
+            )
+        return row
+
     def guard(stage, f, *a):
         try:
-            row = f(*a)
+            row = measure(stage, f, *a)
             result["rows"].append(row)
             bench._log(row)
             if row.get("rel_err") is not None and row["rel_err"] > 0.15:
@@ -1546,6 +1770,18 @@ def run(args) -> int:
         print(line)
     if bench.store is not None:
         bench.store.close()
+    iso.stop_monitor()
+    flagged = [
+        f"{r['scenario']}/{r['variant']}/M={r['tokens']}"
+        for r in result["rows"]
+        if r.get("interfered")
+    ]
+    if flagged:
+        msg = (
+            f"{len(flagged)} rows measured with CPU interference: {flagged[:8]}"
+        )
+        result["warnings"].append(msg)
+        print(f"WARNING: {msg}", flush=True)
     result["wall_s"] = time.perf_counter() - t_start
     write_outputs(out_dir, result)
     print(
@@ -1591,7 +1827,26 @@ DEFINITIONS = {
         "compute_ms": "GPU kernel time: CUDA events around a CUDA-graph replay of the expert "
         "(falls back to an eager event span if capture fails; see kernel_timing)",
         "total_ms": "host wall time of one eager expert call incl. torch.cuda.synchronize",
-        "overhead_ms": "total - compute: Python dispatch + kernel launches + sync",
+        "overhead_ms": "= exposed_overhead_ms",
+        "exposed_overhead_ms": "total - graph kernel time: the part of dispatch, launch "
+        "and sync that the GPU does not hide.  While the host dispatch outlasts the "
+        "kernels (small M) it is ~dispatch; once kernels run longer, dispatch overlaps "
+        "GPU execution and only the tail (last launch + sync) stays exposed",
+        "host_dispatch_ms": "wall time until the eager call returns, before any sync",
+        "hidden_dispatch_ms": "max(0, host_dispatch - exposed_overhead): dispatch that "
+        "ran while the GPU was busy",
+        "launches_per_call": "kernel nodes in a CUDA-graph capture of one call "
+        "(graph_nodes in the JSON also counts memcpy/memset nodes)",
+    },
+    "interference": {
+        "interfered": "row flagged: an S2 compute thread (or, any scenario, the main "
+        "thread) waited > --interference-delay-ms on the run queue, pinned compute "
+        "threads migrated, or the monitor saw > --interference-foreign-pct foreign load "
+        "on a compute CPU or its SMT sibling during the row",
+        "run_delay_max_ms": "max over compute threads (S2) / the main thread (S1, S3) "
+        "of schedstat run-queue delay during the row",
+        "foreign_max_pct": "max foreign load on one compute CPU in one monitor sample",
+        "attempts": "measurements of this row (--retry-interfered)",
     },
     "cpu_compute": {
         "d2h_ms": "activations GPU -> host buffer (pinned by default) + stream sync",
@@ -1641,7 +1896,12 @@ def maybe_reexec_pinned(argv) -> None:
     if args.omp_pin != "auto" or args.list_experts or args.device != "cuda":
         return
     affinity = set(os.sched_getaffinity(0))
-    if args.cpu_bind:
+    if args.compute_cores:
+        cores = bench_env.physical_cores(
+            bench_env.parse_cpulist(args.compute_cores)
+        )
+        node = args.membind_node
+    elif args.cpu_bind:
         cores = sorted(bench_env.parse_cpulist(args.cpu_bind))
         node = args.membind_node
     else:
@@ -1655,7 +1915,14 @@ def maybe_reexec_pinned(argv) -> None:
     if not cores:
         return
     env = dict(os.environ)
-    env.update(bench_env.pinning_env(cores, args.cpu_threads or None))
+    hk = None
+    if args.isolate == "soft":
+        hk = bench_env.parse_cpulist(args.housekeeping_cpus) & set(cores)
+    env.update(
+        bench_env.pinning_env(
+            cores, args.cpu_threads or None, hk, args.main_thread
+        )
+    )
     env["EP_REEXEC"] = "1"
     extra = []
     if node is not None and args.membind_node is None:

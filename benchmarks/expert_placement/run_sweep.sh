@@ -12,6 +12,10 @@
 #            NUMA_NODE (auto) SKIP_DRY_RUN=1 IDLE_MIB REQUIRE_STORE=0 (--expert-store torch)
 #            EXCLUDE_CPUS (e.g. 0-7) OUT_OWNER (uid:gid for the outputs; default: repo owner)
 #            OMP_PIN=0 (do not pin OpenMP threads; diagnostics only)
+#            CORES (explicit core list instead of the GPU node's, e.g. 72-95)
+#            ISOLATE=1 soft isolation: HOUSEKEEPING (0-7) ISO_MAIN (housekeeping|compute)
+#            NOISE_CHECK_S (10) NOISE_ABORT_PCT (30, isolation only) RETRY (2 isolated, 0 else)
+#            MONITOR (auto: on under isolation)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -95,18 +99,52 @@ print(",".join(map(str, keep)))
 PYEOF
 )
 fi
-n_phys=$(echo "$phys" | tr ',' '\n' | wc -l)
-CPU_THREADS="${CPU_THREADS:-$n_phys}"
-export OMP_NUM_THREADS="$CPU_THREADS"
-# Pin one OpenMP thread per physical core (explicit places, so this holds with
-# numactl or with the in-process binding). Unpinned spin-waiting threads on a
-# fully used core set get stacked and stall a time slice per barrier.
-# OMP_PIN=0 keeps the old unpinned behaviour (diagnostics only).
-if [ "${OMP_PIN:-1}" = "1" ] && [ -z "${OMP_PROC_BIND:-}${OMP_PLACES:-}${GOMP_CPU_AFFINITY:-}" ]; then
-    places=$(echo "$phys" | tr ',' '\n' | head -n "$CPU_THREADS" | sed 's/.*/{&}/' | paste -sd, -)
-    export OMP_PROC_BIND=close OMP_PLACES="$places"
+if [ -n "${CORES:-}" ]; then
+    # Explicit core set (e.g. CORES=72-95 for the isolated-core A/B): physical
+    # cores only, SMT siblings dropped.
+    phys=$(python3 - "$BENCH" "$CORES" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from cpu_layout import parse_cpulist, smt_siblings
+keep, drop = [], set()
+for c in sorted(parse_cpulist(sys.argv[2])):
+    if c not in drop:
+        keep.append(c)
+        drop.update(smt_siblings([c])[c])
+print(",".join(map(str, keep)))
+PYEOF
+)
 fi
-export EP_ALLOWED_CPUS="$(echo "$phys" | tr ',' '\n' | head -n "$CPU_THREADS" | paste -sd, -)"
+n_phys=$(echo "$phys" | tr ',' '\n' | wc -l)
+# Soft isolation (ISOLATE=1): OpenMP workers on the cores minus HOUSEKEEPING
+# (SMT siblings idle); main thread (ISO_MAIN=housekeeping) and all our helper
+# threads (MoE-Infinity task-pool/AIO, monitor) on HOUSEKEEPING.  Nothing
+# outside this container is changed; see the guide for strict isolation.
+ISOLATE="${ISOLATE:-0}"
+HOUSEKEEPING="${HOUSEKEEPING:-0-7}"
+ISO_MAIN="${ISO_MAIN:-housekeeping}"
+ISOARGS=()
+if [ "$ISOLATE" = "1" ]; then
+    eval "$(python3 "$BENCH/cpu_layout.py" --cpus "$phys" --housekeeping "$HOUSEKEEPING" \
+        --main "$ISO_MAIN" --threads "${CPU_THREADS:-0}")"
+    CPU_THREADS="$OMP_NUM_THREADS"
+    ISOARGS=(--noise-check-s "${NOISE_CHECK_S:-10}" --noise-abort-pct "${NOISE_ABORT_PCT:-30}"
+             --retry-interfered "${RETRY:-2}" --monitor "${MONITOR:-auto}")
+    echo "soft isolation: ${EP_N_COMPUTE} compute cores (${EP_COMPUTE_CPUS}), housekeeping ${EP_HOUSEKEEPING_CPUS}, main thread on ${EP_MAIN_THREAD}"
+else
+    CPU_THREADS="${CPU_THREADS:-$n_phys}"
+    export OMP_NUM_THREADS="$CPU_THREADS"
+    # Pin one OpenMP thread per physical core (explicit places, so this holds with
+    # numactl or with the in-process binding). Unpinned spin-waiting threads on a
+    # fully used core set get stacked and stall a time slice per barrier.
+    # OMP_PIN=0 keeps the old unpinned behaviour (diagnostics only).
+    if [ "${OMP_PIN:-1}" = "1" ] && [ -z "${OMP_PROC_BIND:-}${OMP_PLACES:-}${GOMP_CPU_AFFINITY:-}" ]; then
+        places=$(echo "$phys" | tr ',' '\n' | head -n "$CPU_THREADS" | sed 's/.*/{&}/' | paste -sd, -)
+        export OMP_PROC_BIND=close OMP_PLACES="$places"
+    fi
+    export EP_ALLOWED_CPUS="$(echo "$phys" | tr ',' '\n' | head -n "$CPU_THREADS" | paste -sd, -)"
+    ISOARGS=(--noise-check-s "${NOISE_CHECK_S:-10}" --retry-interfered "${RETRY:-0}" --monitor "${MONITOR:-off}")
+fi
 export EP_REEXEC=1
 echo "GPU NUMA node ${NUMA_NODE}; ${n_phys} physical cores (${phys}); ${CPU_THREADS} CPU threads; OMP_PROC_BIND=${OMP_PROC_BIND:-unset}"
 
@@ -123,12 +161,12 @@ fi
 
 COMMON=(--model-dir "$MODEL_DIR" --layer "$LAYER" --expert "$EXPERT" --cpu-threads "$CPU_THREADS"
         --precision "$PRECISION" --fetch-modes "$FETCH_MODES")
-RUNARGS=("${COMMON[@]}" "${PYBIND[@]}")
+RUNARGS=("${COMMON[@]}" "${PYBIND[@]}" "${ISOARGS[@]}")
 cd "$REPO"
 python3 "$BENCH/expert_placement_bench.py" "${COMMON[@]}" --list-experts | tee "$OUT/list_experts.txt"
 if [ "${SKIP_DRY_RUN:-0}" != "1" ]; then
     set +e
-    "${BIND[@]}" python3 "$BENCH/expert_placement_bench.py" "${RUNARGS[@]}" --dry-run \
+    "${BIND[@]}" python3 "$BENCH/expert_placement_bench.py" "${RUNARGS[@]}" --dry-run --noise-check-s 0 \
         --scenarios "$SCENARIOS" --gpu-kernels "$GPU_KERNELS" --cpu-kernels "$CPU_KERNELS" \
         --out-dir "$OUT/dry_run" "$@" 2>&1 | tee "$OUT/dry_run.log"
     dry_rc=${PIPESTATUS[0]}

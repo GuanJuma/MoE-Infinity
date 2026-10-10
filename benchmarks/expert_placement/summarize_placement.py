@@ -169,7 +169,7 @@ def split_tables(result, curves) -> list:
     for (s, v), pts in curves.items():
         lines += ["", f"## {LABEL[s]} `{v}`: compute vs overhead (ms)", ""]
         if s == "gpu_resident":
-            hdr = "| tokens | total | compute (kernel) | overhead (launch+sync) | overhead % | TFLOPS | p10-p90 total | err |"
+            hdr = "| tokens | total | compute (kernel) | exposed overhead | exposed % | host dispatch | hidden dispatch | launches | TFLOPS | p10-p90 total | err |"
         elif s == "cpu_compute":
             hdr = "| tokens | total | compute (CPU) | of which act quant | overhead | = d2h + h2d | overhead % | TFLOPS | p10-p90 total | err | err vs W8A8 ref |"
         else:
@@ -193,8 +193,13 @@ def split_tables(result, curves) -> list:
                 cells = [
                     _f(r["total_ms"]),
                     _f(r["compute_ms"]),
-                    _f(r["overhead_ms"]),
+                    _f(r.get("exposed_overhead_ms", r["overhead_ms"])),
                     f"{share:.0f}%",
+                    _f(r.get("host_dispatch_ms")),
+                    _f(r.get("hidden_dispatch_ms")),
+                    "-"
+                    if r.get("launches_per_call") is None
+                    else str(r["launches_per_call"]),
                     _f(r.get("compute_TFLOPS"), 2),
                     rng,
                     err,
@@ -226,8 +231,67 @@ def split_tables(result, curves) -> list:
                     err,
                     err8,
                 ]
-            lines.append(f"| {t} | " + " | ".join(cells) + " |")
+            mark = " ⚠" if r.get("interfered") else ""
+            lines.append(f"| {t}{mark} | " + " | ".join(cells) + " |")
+        if s == "gpu_resident":
+            lines += [
+                "",
+                "exposed overhead = total - graph kernel; host dispatch = time until the "
+                "eager call returns (no sync); hidden dispatch = dispatch - exposed, i.e. "
+                "dispatch that ran while the GPU was busy (it grows with M as kernels "
+                "outlast the dispatch). launches = kernel nodes in a CUDA-graph capture.",
+            ]
     return lines
+
+
+def interference_lines(result) -> list:
+    iso = (result.get("env") or {}).get("isolation")
+    nc = result.get("noise_check")
+    rows = result.get("rows", [])
+    if not iso and not nc and not any("interfered" in r for r in rows):
+        return []
+    out = ["", "## CPU isolation and interference", ""]
+    if iso:
+        out.append(
+            f"- layout: {iso.get('mode')}; compute CPUs {iso.get('compute_cpus')}, "
+            f"housekeeping {iso.get('housekeeping_cpus') or '-'} (main thread: "
+            f"{iso.get('main_thread')}), SMT siblings idle {iso.get('smt_siblings_left_idle') or '-'}, "
+            f"monitor {'on' if iso.get('monitor') else 'off'}; threads {iso.get('threads')}"
+        )
+    if nc:
+        out.append(
+            f"- pre-run noise check ({nc.get('seconds')} s): foreign load mean max "
+            f"{nc.get('foreign_mean_max_pct')}% of a core, worst window "
+            f"{nc.get('foreign_max_pct')}% (CPU {nc.get('foreign_max_cpu')}), SMT siblings "
+            f"{nc.get('sibling_max_pct')}%; busiest {nc.get('busiest_cpus') or '-'}; "
+            f"visible processes {nc.get('procs') or '-'}"
+        )
+    flagged = [r for r in rows if r.get("interfered")]
+    retried = [r for r in rows if (r.get("attempts") or 1) > 1]
+    out.append(
+        f"- rows flagged (⚠): {len(flagged)} of {len(rows)}; re-measured: {len(retried)}"
+    )
+    if flagged:
+        out += ["", "| row | reasons | attempts |", "|---|---|---:|"]
+        for r in flagged[:40]:
+            out.append(
+                f"| {r['scenario']}/{r['variant']}/M={r['tokens']} | "
+                f"{'; '.join((r.get('interference') or {}).get('reasons', []))} | "
+                f"{r.get('attempts') or 1} |"
+            )
+    s2 = [
+        r
+        for r in rows
+        if r.get("scenario") == "cpu_compute" and "run_delay_max_ms" in r
+    ]
+    if s2:
+        worst = max(s2, key=lambda r: r.get("run_delay_max_ms") or 0)
+        out.append(
+            f"- S2 worst compute-thread run-queue delay: {worst.get('run_delay_max_ms')} ms "
+            f"({worst['variant']} M={worst['tokens']}); max foreign load in a row: "
+            f"{max((r.get('foreign_max_pct') or 0) for r in s2)}%"
+        )
+    return out
 
 
 def best_per_scenario(curves):
@@ -414,6 +478,7 @@ def render(result, plot_dir=None) -> str:
         header(result)
         + [""]
         + total_table(result, curves)
+        + interference_lines(result)
         + split_tables(result, curves)
         + crossovers(curves)
         + mi_vs_raw(curves)

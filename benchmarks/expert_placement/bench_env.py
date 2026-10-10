@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
+import cpu_layout
 import torch
 
 ENV_KEYS = (
@@ -574,7 +575,9 @@ def omp_pinned(env=None) -> bool:
     return bool(v and v != "false") or any(env.get(k) for k in OMP_PIN_VARS[1:])
 
 
-def pinning_env(cores, threads: Optional[int] = None) -> Dict[str, str]:
+def pinning_env(
+    cores, threads: Optional[int] = None, housekeeping=None, main="housekeeping"
+) -> Dict[str, str]:
     """OpenMP pinning for ``cores`` (absolute CPU ids, one thread each).
 
     Unpinned OpenMP threads that spin-wait on a fully subscribed core set get
@@ -582,15 +585,21 @@ def pinning_env(cores, threads: Optional[int] = None) -> Dict[str, str]:
     appear (MoE-Infinity's task-pool threads, host agents); every barrier then
     waits out a time slice (tens of ms per call).  Pinning one thread per core
     removes that.  libgomp reads these variables only at start-up.
+    ``housekeeping``: soft isolation, see cpu_layout.layout.
     """
-    cores = list(cores)
-    n = len(cores) if not threads else min(int(threads), len(cores))
-    return {
-        "OMP_PROC_BIND": "close",
-        "OMP_PLACES": ",".join("{%d}" % c for c in cores[:n]),
-        "OMP_NUM_THREADS": str(n),
-        "EP_ALLOWED_CPUS": ",".join(map(str, cores[:n])),
-    }
+    return cpu_layout.layout(cores, threads, housekeeping, main)["env"]
+
+
+def first_place(env=None) -> Optional[set]:
+    """CPUs of the first OpenMP place (where libgomp binds the main thread)."""
+    env = os.environ if env is None else env
+    places = env.get("OMP_PLACES", "")
+    if not places.startswith("{") or "}" not in places:
+        return None
+    try:
+        return parse_cpulist(places[1 : places.index("}")])
+    except ValueError:
+        return None
 
 
 def allowed_cpus(env=None) -> set:
