@@ -8,9 +8,16 @@ Hy3-FP8; any gate/up/down expert layout works) and measures, for every token
 count M (= rows routed to this expert):
 
   gpu_resident           weights live in GPU memory, computed on the GPU
-  cpu_compute            weights live in host memory, computed on the CPU
-  cpu_store_gpu_compute  weights live in host memory, copied to the GPU
-                         (pinned and pageable sources), computed on the GPU
+  cpu_compute            weights live in MoE-Infinity's pinned host pool,
+                         computed on the CPU
+  cpu_store_gpu_compute  weights live in MoE-Infinity's pinned host pool,
+                         moved to the GPU by MoE-Infinity's own fetch /
+                         prefetch / cache code, computed on the GPU
+
+Precision (``--precision``): ``fp8`` (default) keeps the expert as the
+checkpoint's FP8 e4m3 bytes (~18 MiB for Hy3) in all three scenarios;
+``bf16`` dequantizes the chosen FP8 expert once to BF16 (``w *
+weight_scale``, ~36 MiB) and uses that everywhere with BF16 kernels.
 
 Per-scenario split (all medians over repeats, milliseconds):
 
@@ -23,19 +30,27 @@ Per-scenario split (all medians over repeats, milliseconds):
     overhead = total - compute  (Python dispatch, kernel launches, sync)
   cpu_compute   (hidden states start on the GPU, result must end there)
     d2h      = activations GPU -> pinned host buffer + stream sync
-    compute  = CPU kernel wall time (result written in place into the buffer)
+    compute  = CPU kernel wall time (result written in place into the
+               buffer); act_quant_ms = the FP8 activation rounding inside it
+               (sglang_fp8_w8a8_emu)
     h2d      = result pinned buffer -> GPU + stream sync
     total    = d2h + compute + h2d (one wall-clock span)
     overhead = total - compute
   cpu_store_gpu_compute
-    xfer     = H2D copy of the expert's GPU-ready weight tensors into
-               preallocated GPU buffers (CUDA events around the copies)
-    compute  = GPU kernel time right after the copy (graph replay, events)
-    total    = host wall time of copy + eager call + sync
-    overhead = total - compute  (= xfer + launch/dispatch)
+    xfer     = MoE-Infinity's move of the expert node from its pinned host
+               pool to the GPU (mi_fetch: begin() = AcquireTensor ->
+               ArcherTaskPool -> Node::SetDevice incl. its bookkeeping;
+               mi_fetch_evict: same with the cache full; mi_prefetch:
+               prefetch_tensors + wait), host wall time.  raw_pinned /
+               raw_pageable = plain torch copy_ of the same bytes, reference
+               lines only.
+    compute  = GPU kernel time right after the move
+    total    = move + eager call + sync (+ end() release for mi_*)
+    overhead = total - compute  (= xfer + release + launch/dispatch)
 
-One-time costs (checkpoint read, weight layout prep, CPU packing, GPU upload,
-pinned allocation) are reported separately under ``setup``.
+One-time costs (checkpoint read, BF16 dequantization, weight layout prep,
+CPU packing, store offload / topology init, GPU upload, pinned allocation)
+are reported separately under ``setup``.
 
 Caches: before every timed repeat the GPU L2 and the CPU LLC are flushed by
 writing a buffer of 2x their size (outside the timed region), so weights are
@@ -58,6 +73,7 @@ import statistics
 import sys
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -65,6 +81,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(1, str(HERE.parents[1]))
 
 import bench_env  # noqa: E402
+import mi_expert_store  # noqa: E402
 import torch  # noqa: E402
 from checkpoint_expert import (  # noqa: E402
     CheckpointError,
@@ -77,13 +94,19 @@ from checkpoint_expert import (  # noqa: E402
 )
 from expert_runners import (  # noqa: E402
     CPU_KERNELS,
+    FP8_CPU_KERNELS,
+    FP8_GPU_KERNELS,
     GPU_KERNELS,
+    PRECISIONS,
+    W8A8_KERNELS,
     KernelUnavailable,
     build_cpu_runner,
     build_gpu_runner,
+    default_kernels,
     expert_flops,
     fmt_bytes,
     reference_expert,
+    reference_expert_w8a8,
     rel_err,
     resolve_gpu_kernels,
 )
@@ -124,6 +147,13 @@ CSV_FIELDS = [
     "repeats",
     "kernel_timing",
     "rel_err",
+    "rel_err_w8a8",
+    "numerics",
+    "storage",
+    "fetch_path",
+    "act_quant_ms",
+    "release_ms",
+    "mi_h2d_bytes",
     "note",
 ]
 
@@ -285,6 +315,8 @@ class Bench:
         else:
             self.x_std = float(args.x_std)
         self._ref_cache = {}
+        self.outputs = {}
+        self.store = None
 
     # -- inputs and numerics ------------------------------------------------
 
@@ -293,18 +325,30 @@ class Bench:
         x = torch.randn(M, self.K, generator=g) * self.x_std
         return x.to(self.dtype).to(device).contiguous()
 
-    def check(self, out, x, M):
+    def numerics(self, out, x, M, kernel, key=None):
+        """rel_err vs the FP32 reference (dequantized weights, unquantized
+        activations) and, for W8A8 kernels, vs the FP32 W8A8 reference
+        (same FP8 weights, e4m3-rounded activations).  Outputs are kept for
+        the GPU-vs-CPU parity table."""
         if M > self.args.check_max_tokens:
-            return None
+            return {"rel_err": None, "rel_err_w8a8": None}
+        dev = self.device if self.device.type == "cuda" else torch.device("cpu")
         if M not in self._ref_cache:
-            dev = (
-                self.device
-                if self.device.type == "cuda"
-                else torch.device("cpu")
-            )
-            self._ref_cache[M] = reference_expert(x.to(dev), self.ew)
-        ref = self._ref_cache[M]
-        return rel_err(out.to(ref.device), ref)
+            xd = x.to(dev)
+            w8 = None
+            if self.ew.gate.is_fp8 and self.ew.gate.scheme == "per_tensor":
+                w8 = reference_expert_w8a8(xd, self.ew)
+            self._ref_cache[M] = (reference_expert(xd, self.ew), w8)
+        ref, ref8 = self._ref_cache[M]
+        o = out.to(dev)
+        if key is not None:
+            self.outputs[(key, M)] = o.float().cpu()
+        return {
+            "rel_err": rel_err(o, ref),
+            "rel_err_w8a8": rel_err(o, ref8)
+            if (ref8 is not None and kernel in W8A8_KERNELS)
+            else None,
+        }
 
     def _row(self, scenario, variant, kernel, host_mem, M, **kw):
         row = {k: None for k in CSV_FIELDS}
@@ -353,7 +397,7 @@ class Bench:
             reset()
         out = fn()
         c.sync()
-        err = self.check(out, x, M)
+        num = self.numerics(out, x, M, runner.kernel, ("gpu", runner.kernel))
         graph, timing = try_graph(fn, reset, c, self.args.gpu_timing)
 
         def it_kernel():
@@ -404,7 +448,11 @@ class Bench:
             eager_gpu_span_ms=summarize(se, "span")[0],
             repeats=min(len(sk), len(se)),
             kernel_timing=timing,
-            rel_err=err,
+            numerics=runner.meta.get(
+                "numerics", "W8A8" if runner.kernel in W8A8_KERNELS else "BF16"
+            ),
+            storage=self.gpu_storage,
+            **num,
         )
         del graph
         return row
@@ -420,7 +468,9 @@ class Bench:
         fn, _ = runner.bind(x_host)
         x_host.copy_(x_dev)
         out = fn()
-        err = self.check(out, x_dev, M)
+        num = self.numerics(
+            out, x_dev, M, runner.kernel, ("cpu", runner.kernel)
+        )
 
         def it():
             fl.flush_cpu()
@@ -439,6 +489,7 @@ class Bench:
                 "compute": (t2 - t1) * 1e3,
                 "h2d": (t3 - t2) * 1e3,
                 "total": (t3 - t0) * 1e3,
+                **runner.last,
             }
 
         s = run_repeats(it, self.args)
@@ -466,12 +517,19 @@ class Bench:
             xfer_bytes=act_bytes,
             repeats=len(s),
             kernel_timing="host_wall",
-            rel_err=err,
+            act_quant_ms=summarize(s, "act_quant_ms")[0],
+            numerics=runner.meta.get(
+                "numerics", "BF16/INT8 (non-FP8 comparison)"
+            ),
+            storage=self.cpu_storage.get(runner.kernel, "torch tensors"),
+            **num,
         )
 
     # -- scenario 3 -----------------------------------------------------------
 
-    def cpu_store_gpu_compute(self, runner, host, host_mem, M):
+    def raw_fetch(self, runner, host, host_mem, M):
+        """Reference line: plain torch ``copy_`` (cudaMemcpy) of the same
+        bytes into preallocated buffers -- not MoE-Infinity's fetch path."""
         c, fl = self.clock, self.flusher
         x = self.make_x(M, self.device)
         fn, reset = runner.bind(x)
@@ -491,7 +549,7 @@ class Bench:
             reset()
         out = fn()
         c.sync()
-        err = self.check(out, x, M)
+        num = self.numerics(out, x, M, runner.kernel)
         graph, timing = try_graph(fn, reset, c, self.args.gpu_timing)
 
         def it_kernel():
@@ -534,7 +592,7 @@ class Bench:
         x50, x10, x90 = summarize(se, "xfer")
         row = self._row(
             "cpu_store_gpu_compute",
-            f"{runner.kernel}+{host_mem}",
+            f"{runner.kernel}+raw_{host_mem}",
             runner.kernel,
             host_mem,
             M,
@@ -554,7 +612,161 @@ class Bench:
             pipelined_ms=max(x50, k50),
             repeats=min(len(sk), len(se)),
             kernel_timing=timing,
-            rel_err=err,
+            storage=f"torch {host_mem} tensor",
+            fetch_path="reference: torch copy_ (cudaMemcpy), not MoE-Infinity",
+            numerics="W8A8" if runner.kernel in W8A8_KERNELS else "BF16",
+            **num,
+        )
+        del graph
+        return row
+
+    def mi_fetch(self, runner, mode, M):
+        """S3 through MoE-Infinity: the expert node sits in MoE-Infinity's
+        pinned host pool and is moved by the runtime's own code.
+
+        ``mi_fetch``       demand fetch (``begin``), free cache slot
+        ``mi_fetch_evict`` demand fetch with the cache full: MoE-Infinity
+                           evicts the other cached expert first
+        ``mi_prefetch``    ``prefetch_tensors`` + wait until resident
+        Eviction back to the host pool happens outside the timed region.
+        """
+        c, fl, st = self.clock, self.flusher, self.store
+        node, other = f"gpu:{runner.kernel}", f"other:{runner.kernel}"
+        x = self.make_x(M, self.device)
+        fn, reset = runner.bind(x)
+        node_bytes = st.nodes[node].aligned_bytes
+
+        def prepare():
+            st.evict_all()
+            st.set_cache_limit(None)
+            if mode == "mi_fetch_evict":
+                st.fetch(other)
+                st.release(other)
+                st.set_cache_limit(node_bytes)
+            if reset:
+                reset()
+
+        def move():
+            if mode == "mi_prefetch":
+                st.prefetch(node)
+            else:
+                st.fetch(node)
+
+        def after():
+            if mode != "mi_prefetch":
+                st.release(node)
+
+        def ptrs():
+            return [t.data_ptr() for t in runner.weights.values()]
+
+        prepare()
+        b0 = st.h2d_bytes_total()
+        move()
+        moved = st.h2d_bytes_total() - b0
+        wdev = runner.weights["w13"].device
+        if wdev.type != self.device.type:
+            raise RuntimeError(
+                f"expert not on {self.device} after {mode} (on {wdev})"
+            )
+        out = fn()
+        c.sync()
+        num = self.numerics(out, x, M, runner.kernel)
+        graph, timing = try_graph(fn, reset, c, self.args.gpu_timing)
+        graph_ptrs = ptrs()
+        after()
+        if graph is not None:
+            timing += (
+                " (replayed when the fetched block reuses the captured address)"
+            )
+        n_eager = 0
+
+        def it_kernel():
+            nonlocal n_eager
+            prepare()
+            fl.flush_gpu()
+            c.sync()
+            move()
+            e0, e1 = c.events(2)
+            e0.record()
+            if graph is not None and ptrs() == graph_ptrs:
+                graph.replay()
+            else:
+                n_eager += 1
+                fn()
+            e1.record()
+            c.sync()
+            after()
+            return {"kernel": e0.elapsed_time(e1)}
+
+        def it_eager():
+            prepare()
+            fl.flush_gpu()
+            c.sync()
+            e0, e1 = c.events(2)
+            t0 = time.perf_counter()
+            move()
+            t1 = time.perf_counter()
+            e0.record()
+            fn()
+            e1.record()
+            c.sync()
+            t2 = time.perf_counter()
+            after()
+            t3 = time.perf_counter()
+            return {
+                "xfer": (t1 - t0) * 1e3,
+                "span": e0.elapsed_time(e1),
+                "total": (t3 - t0) * 1e3,
+                "release": (t3 - t2) * 1e3,
+            }
+
+        sk = run_repeats(it_kernel, self.args)
+        se = run_repeats(it_eager, self.args)
+        if n_eager:
+            timing += f"; {n_eager}/{len(sk)} eager (address changed)"
+        k50, k10, k90 = summarize(sk, "kernel")
+        t50, t10, t90 = summarize(se, "total")
+        x50, x10, x90 = summarize(se, "xfer")
+        rel50 = summarize(se, "release")[0]
+        st.evict_all()
+        st.set_cache_limit(None)
+        paths = {
+            "mi_fetch": "MoE-Infinity begin(): AcquireTensor -> ArcherTaskPool on-demand "
+            "task -> Node::SetDevice (pinned host pool -> device pool)",
+            "mi_fetch_evict": "MoE-Infinity begin() with the expert cache full: "
+            "RemoveCachedSparseNode evicts the cached expert, then ArcherTaskPool "
+            "-> Node::SetDevice",
+            "mi_prefetch": "MoE-Infinity prefetch_tensors -> ArcherTaskPool -> "
+            "Node::SetDevice; wait until resident",
+        }
+        row = self._row(
+            "cpu_store_gpu_compute",
+            f"{runner.kernel}+{mode}",
+            runner.kernel,
+            "mi_pinned_pool",
+            M,
+            total_ms=t50,
+            compute_ms=k50,
+            overhead_ms=t50 - k50,
+            xfer_ms=x50,
+            release_ms=rel50,
+            launch_ms=t50 - k50 - x50 - rel50,
+            total_p10_ms=t10,
+            total_p90_ms=t90,
+            compute_p10_ms=k10,
+            compute_p90_ms=k90,
+            xfer_p10_ms=x10,
+            xfer_p90_ms=x90,
+            eager_gpu_span_ms=summarize(se, "span")[0],
+            xfer_bytes=st.nodes[node].nbytes,
+            mi_h2d_bytes=moved,
+            pipelined_ms=max(x50, k50),
+            repeats=min(len(sk), len(se)),
+            kernel_timing=timing,
+            storage="MoE-Infinity pinned host pool (kHostMemoryPool)",
+            fetch_path=paths[mode],
+            numerics="W8A8" if runner.kernel in W8A8_KERNELS else "BF16",
+            **num,
         )
         del graph
         return row
@@ -600,20 +812,47 @@ def parse_args(argv=None):
         "--scenarios", default="gpu,cpu,fetch", help="subset of gpu,cpu,fetch"
     )
     p.add_argument(
+        "--precision",
+        default="fp8",
+        choices=PRECISIONS,
+        help="fp8: the expert is the checkpoint's FP8 bytes everywhere; bf16: the "
+        "chosen FP8 expert dequantized to BF16 (w * weight_scale) everywhere",
+    )
+    p.add_argument(
         "--gpu-kernels",
-        default="auto",
-        help=f"comma list from {GPU_KERNELS} or 'auto' (= every one that applies)",
+        default="default",
+        help=f"comma list from {GPU_KERNELS}; 'default' = sglang_triton,torch_scaled_mm "
+        f"(fp8) or batchgen_triton,torch_bf16,sglang_triton (bf16); 'auto' = the FP8 "
+        f"ones that are available",
     )
     p.add_argument(
         "--cpu-kernels",
-        default="sglang_fp8_w8a16,sglang_bf16",
-        help=f"comma list from {CPU_KERNELS}",
+        default="default",
+        help=f"comma list from {CPU_KERNELS}; 'default' = sglang_fp8_w8a16,"
+        f"sglang_fp8_w8a8_emu (fp8) or sglang_bf16 (bf16)",
     )
     p.add_argument(
-        "--fetch-host-mem",
-        default="pinned,pageable",
-        help="host memory for scenario 3",
+        "--fetch-modes",
+        default="mi_fetch,mi_fetch_evict,mi_prefetch,raw_pinned,raw_pageable",
+        help="scenario 3 load paths: mi_* = MoE-Infinity's store/cache/fetch code; "
+        "raw_* = reference torch copy_ of the same bytes",
     )
+    p.add_argument(
+        "--expert-store",
+        default="moe_infinity",
+        choices=("moe_infinity", "torch"),
+        help="where host-side experts live (S2 weights, S3 source)",
+    )
+    p.add_argument(
+        "--mi-store-lib", default="moe_infinity._store", help=argparse.SUPPRESS
+    )
+    p.add_argument("--mi-device-memory-ratio", type=float, default=0.5)
+    p.add_argument(
+        "--mi-store-dir",
+        default=None,
+        help="offload dir (default <out>/mi_store)",
+    )
+    p.add_argument("--keep-mi-store", action="store_true")
     p.add_argument(
         "--act-host-mem", default="pinned", choices=("pinned", "pageable")
     )
@@ -707,6 +946,10 @@ def print_inspection(info):
         f"quantization   : {cfg['quant_method']} activation_scheme={cfg['activation_scheme']} "
         f"weight_block_size={cfg['weight_block_size']}"
     )
+    print(
+        f"dtype          : dtype={cfg['dtype']} torch_dtype={cfg['torch_dtype']}  "
+        f"quantization_config={json.dumps(cfg['quantization_config'])}"
+    )
     print(f"MoE layers     : {info['moe_layers']}")
     seen = {}
     for L, le in info["layers"].items():
@@ -769,6 +1012,16 @@ def run(args) -> int:
     )
     ew = load_expert(index, cfg, layer, args.expert, layers)
     load_ms = (time.perf_counter() - t0) * 1e3
+    ckpt_desc = ew.describe()
+    dequant_ms = None
+    if args.precision == "fp8" and not ew.gate.is_fp8:
+        raise CheckpointError(
+            f"--precision fp8 needs an FP8 checkpoint; this expert is {ew.quant}"
+        )
+    if args.precision == "bf16" and ew.gate.is_fp8:
+        t0 = time.perf_counter()
+        ew = ew.to_bf16()
+        dequant_ms = (time.perf_counter() - t0) * 1e3
     desc = ew.describe()
     out_dir = Path(
         args.out_dir
@@ -776,7 +1029,8 @@ def run(args) -> int:
     )
     print(
         f"expert L{layer} E{args.expert}: K={ew.hidden_size} N={ew.intermediate_size} {ew.quant} "
-        f"({fmt_bytes(ew.checkpoint_nbytes)}), act={ew.activation}, x dtype={ew.act_dtype}"
+        f"({fmt_bytes(ew.checkpoint_nbytes)}), act={ew.activation}, x dtype={ew.act_dtype}, "
+        f"precision={args.precision} [{ew.source}]"
     )
     print(f"output -> {out_dir}")
 
@@ -805,12 +1059,32 @@ def run(args) -> int:
             f"torch threads {torch.get_num_threads()} > allowed CPUs {aff}"
         )
 
+    def_gpu, def_cpu = default_kernels(args.precision)
     want_cpu = "cpu_compute" in scenarios
     cpu_names = (
-        [k.strip() for k in args.cpu_kernels.split(",") if k.strip()]
+        (
+            list(def_cpu)
+            if args.cpu_kernels == "default"
+            else [k.strip() for k in args.cpu_kernels.split(",") if k.strip()]
+        )
         if want_cpu
         else []
     )
+    gpu_names_req = (
+        list(def_gpu)
+        if args.gpu_kernels == "default"
+        else [k.strip() for k in args.gpu_kernels.split(",") if k.strip()]
+    )
+    if args.precision == "fp8":
+        extra = [
+            k for k in gpu_names_req if k not in FP8_GPU_KERNELS and k != "auto"
+        ]
+        extra += [k for k in cpu_names if k not in FP8_CPU_KERNELS]
+        if extra:
+            warnings.append(
+                f"non-FP8 comparison kernels requested in FP8 mode: {extra} "
+                f"(their expert is BF16/INT8, not the FP8 bytes)"
+            )
     if (
         any(k.startswith("sglang") for k in cpu_names)
         and not args.skip_amx_check
@@ -829,8 +1103,10 @@ def run(args) -> int:
 
     bench = Bench(args, ew, device)
     result = {
-        "schema": "moe-infinity/expert-placement/v1",
+        "schema": "moe-infinity/expert-placement/v2",
+        "precision": args.precision,
         "expert": desc,
+        "checkpoint_expert": ckpt_desc,
         "config": config_summary(cfg),
         "args": vars(args),
         "tokens": tokens,
@@ -838,7 +1114,13 @@ def run(args) -> int:
         "x_std": bench.x_std,
         "flush": bench.flush_sizes,
         "env": env,
-        "setup": {"checkpoint_read_ms": load_ms, "gpu": {}, "cpu": {}},
+        "setup": {
+            "checkpoint_read_ms": load_ms,
+            "expert_source": ew.source,
+            "bf16_dequant_ms": dequant_ms,
+            "gpu": {},
+            "cpu": {},
+        },
         "kernels": {"gpu": {}, "cpu": {}},
         "warnings": warnings,
         "errors": [],
@@ -860,9 +1142,7 @@ def run(args) -> int:
 
     gpu_runners = {}
     if {"gpu_resident", "cpu_store_gpu_compute"} & set(scenarios):
-        names = resolve_gpu_kernels(
-            [k.strip() for k in args.gpu_kernels.split(",")], ew
-        )
+        names = resolve_gpu_kernels(gpu_names_req, ew)
         for k in names:
             try:
                 tt = time.perf_counter()
@@ -908,18 +1188,102 @@ def run(args) -> int:
         sweep = [m for m in (1, 16) if m <= max(tokens)] or [tokens[0]]
         args.warmup, args.repeats, args.min_repeats = 1, 1, 1
 
+    fetch_modes = [m.strip() for m in args.fetch_modes.split(",") if m.strip()]
+    bad = [m for m in fetch_modes if m not in FETCH_MODES]
+    if bad:
+        raise KernelUnavailable(
+            f"unknown fetch modes {bad}; choose from {FETCH_MODES}"
+        )
+    want_fetch = "cpu_store_gpu_compute" in scenarios
     host_copies = {}
-    if "cpu_store_gpu_compute" in scenarios:
+    if want_fetch:
         for k, r in gpu_runners.items():
-            for hm in [
-                h.strip() for h in args.fetch_host_mem.split(",") if h.strip()
-            ]:
-                pinned = hm == "pinned" and device.type == "cuda"
+            for m in fetch_modes:
+                if not m.startswith("raw_"):
+                    continue
+                hm = m[4:]
                 tt = time.perf_counter()
-                host_copies[(k, hm)] = r.host_copy(pinned)
+                host_copies[(k, hm)] = r.host_copy(
+                    hm == "pinned" and device.type == "cuda"
+                )
                 result["setup"]["gpu"][k][f"host_alloc_{hm}_ms"] = (
                     time.perf_counter() - tt
                 ) * 1e3
+
+    bench.gpu_storage = "GPU memory (torch tensors)"
+    bench.cpu_storage = {k: "torch host tensors" for k in cpu_runners}
+    mi_runners = {}
+    want_mi = args.expert_store == "moe_infinity" and (
+        want_cpu
+        or (want_fetch and any(m.startswith("mi_") for m in fetch_modes))
+    )
+    if want_mi:
+        nodes = {}
+        if want_fetch and any(m.startswith("mi_") for m in fetch_modes):
+            for k, r in gpu_runners.items():
+                nodes[f"gpu:{k}"] = {
+                    n: t.detach().cpu() for n, t in r.weights.items()
+                }
+                nodes[f"other:{k}"] = {
+                    n: t.clone() for n, t in nodes[f"gpu:{k}"].items()
+                }
+        for k, r in cpu_runners.items():
+            nodes[f"cpu:{k}"] = dict(r.tensors)
+        if len(nodes) == 1:
+            nodes["other:pad"] = {
+                n: t.clone() for n, t in next(iter(nodes.values())).items()
+            }
+        try:
+            store = mi_expert_store.MoEInfinityExpertStore(
+                args.mi_store_dir
+                or mi_expert_store.offload_dir_default(out_dir),
+                nodes,
+                device_memory_ratio=args.mi_device_memory_ratio,
+                lib=mi_expert_store.load_store_lib(args.mi_store_lib),
+                keep_dir=args.keep_mi_store,
+            )
+            bench.store = store
+            for k, r in cpu_runners.items():
+                r.tensors = store.tensors(f"cpu:{k}")
+                bench.cpu_storage[k] = (
+                    "MoE-Infinity pinned host pool (kHostMemoryPool)"
+                    + (
+                        ""
+                        if store.is_pinned(f"cpu:{k}")
+                        else " [not reported pinned]"
+                    )
+                )
+            for k, r in gpu_runners.items():
+                if f"gpu:{k}" in store.nodes:
+                    mi_runners[k] = replace(
+                        r, weights=store.tensors(f"gpu:{k}")
+                    )
+            result["setup"]["mi_store"] = {
+                "lib": args.mi_store_lib,
+                "offload_ms": store.offload_ms,
+                "topology_init_ms": store.topology_ms,
+                "default_expert_cache_limit": store.default_limit,
+                "nodes": {
+                    n: {
+                        "bytes": h.nbytes,
+                        "node_bytes": h.aligned_bytes,
+                        "tensors": h.order,
+                    }
+                    for n, h in store.nodes.items()
+                },
+            }
+            print(
+                f"MoE-Infinity store: {len(store.nodes)} expert nodes in the pinned host "
+                f"pool (offload {store.offload_ms:.0f} ms, topology {store.topology_ms:.0f} ms)"
+            )
+        except Exception as e:  # noqa: BLE001
+            msg = (
+                f"MoE-Infinity expert store unavailable ({e!r}): S2 weights stay in torch "
+                f"host tensors and S3 runs only the raw reference copies"
+            )
+            result["errors"].append({"stage": "mi_store", "error": repr(e)})
+            result["warnings"].append(msg)
+            print(f"WARNING: {msg}", flush=True)
 
     def guard(stage, f, *a):
         try:
@@ -950,16 +1314,22 @@ def run(args) -> int:
         if "cpu_compute" in scenarios:
             for k, r in cpu_runners.items():
                 guard(f"cpu_compute/{k}/M={M}", bench.cpu_compute, r, M)
-        if "cpu_store_gpu_compute" in scenarios:
-            for (k, hm), host in host_copies.items():
-                guard(
-                    f"cpu_store_gpu_compute/{k}+{hm}/M={M}",
-                    bench.cpu_store_gpu_compute,
-                    gpu_runners[k],
-                    host,
-                    hm,
-                    M,
-                )
+        if want_fetch:
+            for k in gpu_runners:
+                for m in fetch_modes:
+                    stage = f"cpu_store_gpu_compute/{k}+{m}/M={M}"
+                    if m.startswith("raw_"):
+                        hm = m[4:]
+                        guard(
+                            stage,
+                            bench.raw_fetch,
+                            gpu_runners[k],
+                            host_copies[(k, hm)],
+                            hm,
+                            M,
+                        )
+                    elif k in mi_runners:
+                        guard(stage, bench.mi_fetch, mi_runners[k], m, M)
         write_outputs(out_dir, result)
 
     if device.type == "cuda":
@@ -970,6 +1340,11 @@ def run(args) -> int:
                 f"other processes on the GPU at the end: {others}"
             )
             print(f"WARNING: other processes on the GPU at the end:\n{others}")
+    result["parity"] = parity_table(bench.outputs)
+    for line in result["parity"]["lines"]:
+        print(line)
+    if bench.store is not None:
+        bench.store.close()
     result["wall_s"] = time.perf_counter() - t_start
     write_outputs(out_dir, result)
     print(
@@ -977,6 +1352,37 @@ def run(args) -> int:
         f"{len(result['errors'])} errors -> {out_dir}/results.{{csv,json}}"
     )
     return 0 if not result["errors"] or result["rows"] else 1
+
+
+FETCH_MODES = (
+    "mi_fetch",
+    "mi_fetch_evict",
+    "mi_prefetch",
+    "raw_pinned",
+    "raw_pageable",
+)
+
+
+def parity_table(outputs: dict) -> dict:
+    """Relative difference between kernels on identical inputs (same seed)."""
+    by_m = {}
+    for (key, M), out in outputs.items():
+        by_m.setdefault(M, {})[f"{key[0]}:{key[1]}"] = out
+    pairs = {}
+    lines = []
+    for M in sorted(by_m):
+        outs = by_m[M]
+        names = sorted(outs)
+        for i, a in enumerate(names):
+            for b in names[i + 1 :]:
+                d = rel_err(outs[a], outs[b])
+                pairs.setdefault(f"{a} vs {b}", {})[M] = d
+    for pair, vals in pairs.items():
+        lines.append(
+            f"parity {pair}: "
+            + ", ".join(f"M={m} {v:.2e}" for m, v in sorted(vals.items()))
+        )
+    return {"pairs": pairs, "lines": lines}
 
 
 DEFINITIONS = {
@@ -994,12 +1400,23 @@ DEFINITIONS = {
         "overhead_ms": "total - compute",
     },
     "cpu_store_gpu_compute": {
-        "xfer_ms": "H2D copy of all GPU-ready expert weight tensors (CUDA events)",
-        "compute_ms": "GPU kernel time right after the copy (graph replay, events)",
-        "total_ms": "host wall time of copy + eager expert call + sync",
-        "overhead_ms": "total - compute (= xfer + launch_ms)",
-        "pipelined_ms": "max(xfer, compute): lower bound if the copy is fully prefetched/overlapped",
+        "mi_* xfer_ms": "host wall time of MoE-Infinity's own move of the expert node from "
+        "its pinned host pool to the GPU: begin() (AcquireTensor: sparse-cache bookkeeping"
+        "/eviction, ArcherTaskPool on-demand task, Node::SetDevice: device-pool allocation, "
+        "cudaMemcpyAsync on the H2D stream, event sync, tensor re-pointing) or "
+        "prefetch_tensors() + wait until resident",
+        "mi_* release_ms": "end() (post-forward hook bookkeeping); the node stays cached",
+        "raw_* xfer_ms": "reference only: torch copy_ of the same bytes (CUDA events)",
+        "compute_ms": "GPU kernel time right after the move (graph replay when the "
+        "fetched block reuses the captured address, else eager events)",
+        "total_ms": "host wall time of move + eager expert call + sync (+ release for mi_*)",
+        "overhead_ms": "total - compute (= xfer + release + launch_ms)",
+        "pipelined_ms": "max(xfer, compute): lower bound if the move is fully prefetched/overlapped",
     },
+    "rel_err": "vs FP32 reference with dequantized weights and unquantized activations",
+    "rel_err_w8a8": "W8A8 kernels only: vs FP32 reference with the same FP8 weights and "
+    "e4m3-rounded activations (static input_scale)",
+    "parity": "rel difference between kernels on identical inputs, M <= --check-max-tokens",
     "setup": "one-time costs, not in any per-token number",
     "statistics": "median over repeats; p10/p90 given; overhead = median(total) - median(compute)",
     "caches": "GPU L2 and CPU LLC flushed before every timed repeat (outside the timed region)",

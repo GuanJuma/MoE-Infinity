@@ -59,11 +59,14 @@ def header(result) -> list:
     e, env = result["expert"], result["env"]
     gpu = env.get("gpu", {})
     cpu = env.get("cpu", {})
+    setup = result.get("setup", {})
     lines = [
-        f"# Expert placement: layer {e['layer']} expert {e['expert']}",
+        f"# Expert placement: layer {e['layer']} expert {e['expert']} "
+        f"(precision {result.get('precision', 'fp8')})",
         "",
         f"- expert: K={e['hidden_size']} N={e['intermediate_size']} {e['quant']}, "
-        f"{e['checkpoint_bytes'] / 2**20:.1f} MiB in the checkpoint",
+        f"{e['checkpoint_bytes'] / 2**20:.1f} MiB per copy; source: "
+        f"{setup.get('expert_source', e.get('source', 'checkpoint'))}",
         f"- GPU: {gpu.get('name', '-')} {gpu.get('capability', '')}; "
         f"torch {env['versions'].get('torch')} CUDA {env['versions'].get('torch_cuda')}; "
         f"sglang {env['versions'].get('sglang')}; triton {env['versions'].get('triton')}",
@@ -83,6 +86,13 @@ def header(result) -> list:
                     else ""
                 )
             )
+    ms = setup.get("mi_store")
+    if ms:
+        lines.append(
+            f"- MoE-Infinity store ({ms['lib']}): {len(ms['nodes'])} expert nodes in the "
+            f"pinned host pool; offload {ms['offload_ms']:.0f} ms, topology init "
+            f"{ms['topology_init_ms']:.0f} ms"
+        )
     for p in result.get("pcie_probe", []) or []:
         lines.append(
             f"- PCIe {p['kind']} {p['bytes'] / 2**20:.0f} MiB: {p['GBps']:.1f} GB/s"
@@ -137,9 +147,9 @@ def split_tables(result, curves) -> list:
         if s == "gpu_resident":
             hdr = "| tokens | total | compute (kernel) | overhead (launch+sync) | overhead % | TFLOPS | p10-p90 total | err |"
         elif s == "cpu_compute":
-            hdr = "| tokens | total | compute (CPU) | overhead | = d2h + h2d | overhead % | TFLOPS | p10-p90 total | err |"
+            hdr = "| tokens | total | compute (CPU) | of which act quant | overhead | = d2h + h2d | overhead % | TFLOPS | p10-p90 total | err | err vs W8A8 ref |"
         else:
-            hdr = "| tokens | total | compute (kernel) | overhead | = xfer + launch | xfer GB/s | overhead % | pipelined max(xfer,compute) | p10-p90 total | err |"
+            hdr = "| tokens | total | compute (kernel) | overhead | = xfer + release + launch | xfer GB/s | overhead % | pipelined max(xfer,compute) | p10-p90 total | err | err vs W8A8 ref |"
         lines += [hdr, "|" + "---:|" * (hdr.count("|") - 1)]
         for t in sorted(pts):
             r = pts[t]
@@ -150,6 +160,11 @@ def split_tables(result, curves) -> list:
             )
             rng = f"{_f(r['total_p10_ms'])}-{_f(r['total_p90_ms'])}"
             err = f"{r['rel_err']:.1e}" if r.get("rel_err") is not None else "-"
+            err8 = (
+                f"{r['rel_err_w8a8']:.1e}"
+                if r.get("rel_err_w8a8") is not None
+                else "-"
+            )
             if s == "gpu_resident":
                 cells = [
                     _f(r["total_ms"]),
@@ -164,24 +179,27 @@ def split_tables(result, curves) -> list:
                 cells = [
                     _f(r["total_ms"]),
                     _f(r["compute_ms"]),
+                    _f(r.get("act_quant_ms")),
                     _f(r["overhead_ms"]),
                     f"{_f(r['d2h_ms'])} + {_f(r['h2d_ms'])}",
                     f"{share:.0f}%",
                     _f(r.get("compute_TFLOPS"), 2),
                     rng,
                     err,
+                    err8,
                 ]
             else:
                 cells = [
                     _f(r["total_ms"]),
                     _f(r["compute_ms"]),
                     _f(r["overhead_ms"]),
-                    f"{_f(r['xfer_ms'])} + {_f(r['launch_ms'])}",
+                    f"{_f(r['xfer_ms'])} + {_f(r.get('release_ms') or 0)} + {_f(r['launch_ms'])}",
                     _f(r.get("xfer_GBps"), 2),
                     f"{share:.0f}%",
                     _f(r.get("pipelined_ms")),
                     rng,
                     err,
+                    err8,
                 ]
             lines.append(f"| {t} | " + " | ".join(cells) + " |")
     return lines
@@ -223,6 +241,52 @@ def crossovers(curves) -> list:
             f"- {LABEL[a]} vs {LABEL[b]}: {desc}; switches at {flips or 'none'}"
         )
     return lines
+
+
+def mi_vs_raw(curves) -> list:
+    """MoE-Infinity load path vs the raw cudaMemcpy reference, per kernel."""
+    lines = []
+    for (s, v), pts in curves.items():
+        if s != "cpu_store_gpu_compute" or "+mi_" not in v:
+            continue
+        kernel = v.split("+")[0]
+        raw = curves.get((s, f"{kernel}+raw_pinned"))
+        if not raw:
+            continue
+        common = sorted(set(pts) & set(raw))
+        if not common:
+            continue
+        mi = [pts[t]["xfer_ms"] for t in common]
+        rw = [raw[t]["xfer_ms"] for t in common]
+        med = sorted(a - b for a, b in zip(mi, rw))[len(common) // 2]
+        lines.append(
+            f"- `{v}`: MoE-Infinity move {_f(sorted(mi)[len(mi) // 2])} ms vs raw pinned "
+            f"copy {_f(sorted(rw)[len(rw) // 2])} ms -> bookkeeping/sync overhead about "
+            f"{_f(med)} ms (median over token counts)"
+        )
+    if lines:
+        lines = [
+            "",
+            "## MoE-Infinity load path vs raw cudaMemcpy (reference)",
+            "",
+        ] + lines
+    return lines
+
+
+def parity_lines(result) -> list:
+    pairs = (result.get("parity") or {}).get("pairs") or {}
+    if not pairs:
+        return []
+    out = ["", "## Kernel parity on identical inputs (relative difference)", ""]
+    for pair, vals in pairs.items():
+        out.append(
+            f"- {pair}: "
+            + ", ".join(
+                f"M={m} {v:.1e}"
+                for m, v in sorted(vals.items(), key=lambda kv: int(kv[0]))
+            )
+        )
+    return out
 
 
 def plots(result, curves, out_dir: Path) -> list:
@@ -317,6 +381,8 @@ def render(result, plot_dir=None) -> str:
         + total_table(result, curves)
         + split_tables(result, curves)
         + crossovers(curves)
+        + mi_vs_raw(curves)
+        + parity_lines(result)
     )
     if plot_dir is not None:
         lines += ["", "## Plots", ""] + plots(result, curves, Path(plot_dir))

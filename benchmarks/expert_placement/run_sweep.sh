@@ -7,8 +7,9 @@
 #
 #   MODEL_DIR=/model LAYER=1 EXPERT=0 bash benchmarks/expert_placement/run_sweep.sh [extra args]
 #
-# Env knobs: MODEL_DIR LAYER EXPERT OUT TOKENS SCENARIOS GPU_KERNELS CPU_KERNELS
-#            REPEATS CPU_THREADS NUMA_NODE (auto) SKIP_DRY_RUN=1 IDLE_MIB
+# Env knobs: MODEL_DIR LAYER EXPERT PRECISION (fp8|bf16) OUT TOKENS SCENARIOS
+#            GPU_KERNELS CPU_KERNELS FETCH_MODES REPEATS CPU_THREADS
+#            NUMA_NODE (auto) SKIP_DRY_RUN=1 IDLE_MIB
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -16,16 +17,24 @@ BENCH="$REPO/benchmarks/expert_placement"
 MODEL_DIR="${MODEL_DIR:-/model}"
 LAYER="${LAYER:-1}"
 EXPERT="${EXPERT:-0}"
-OUT="${OUT:-/scratch/expert_placement/$(date +%Y%m%d-%H%M%S)_L${LAYER}_E${EXPERT}}"
+PRECISION="${PRECISION:-fp8}"
+OUT="${OUT:-/scratch/expert_placement/$(date +%Y%m%d-%H%M%S)_${PRECISION}_L${LAYER}_E${EXPERT}}"
 TOKENS="${TOKENS:-1,2,3,4,8,16,32,64,128,256,512,1024,2048,4096,8192}"
 SCENARIOS="${SCENARIOS:-gpu,cpu,fetch}"
-GPU_KERNELS="${GPU_KERNELS:-auto}"
-CPU_KERNELS="${CPU_KERNELS:-sglang_fp8_w8a16,sglang_bf16}"
+GPU_KERNELS="${GPU_KERNELS:-default}"
+CPU_KERNELS="${CPU_KERNELS:-default}"
+FETCH_MODES="${FETCH_MODES:-mi_fetch,mi_fetch_evict,mi_prefetch,raw_pinned,raw_pageable}"
 REPEATS="${REPEATS:-30}"
 IDLE_MIB="${IDLE_MIB:-2000}"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/scratch/torch_extensions}"
 mkdir -p "$OUT"
+
+if ! python3 -c "import moe_infinity._store" 2>/dev/null; then
+    echo "ERROR: moe_infinity._store is not built; S2/S3 need MoE-Infinity's expert store." >&2
+    echo "       Build it: python3 $BENCH/build_extensions.py (see the guide)" >&2
+    exit 4
+fi
 
 # --- GPU: exactly one visible, idle ---------------------------------------
 n_gpu=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
@@ -80,7 +89,8 @@ else
     BIND=(taskset -c "$phys")
 fi
 
-COMMON=(--model-dir "$MODEL_DIR" --layer "$LAYER" --expert "$EXPERT" --cpu-threads "$CPU_THREADS")
+COMMON=(--model-dir "$MODEL_DIR" --layer "$LAYER" --expert "$EXPERT" --cpu-threads "$CPU_THREADS"
+        --precision "$PRECISION" --fetch-modes "$FETCH_MODES")
 cd "$REPO"
 python3 "$BENCH/expert_placement_bench.py" "${COMMON[@]}" --list-experts | tee "$OUT/list_experts.txt"
 if [ "${SKIP_DRY_RUN:-0}" != "1" ]; then
