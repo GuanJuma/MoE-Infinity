@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import platform
 import shutil
@@ -257,4 +258,75 @@ def pcie_probe(device: torch.device, sizes, repeats: int = 10) -> list:
             )
             del host
         del dev
+    return out
+
+
+# x86_64 syscall numbers; numactl --membind uses the same call.
+_SYS_SET_MEMPOLICY = 238
+_SYS_GET_MEMPOLICY = 239
+_MPOL_BIND = 2
+_MAX_NODES = 1024
+
+
+def parse_cpulist(spec: str) -> set:
+    cpus = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        a, _, b = part.partition("-")
+        cpus.update(range(int(a), int(b or a) + 1))
+    return cpus
+
+
+def bind_numa(cpus: Optional[str], node: Optional[int]) -> dict:
+    """In-process replacement for ``numactl --physcpubind --membind``.
+
+    Must run before torch starts its thread pools and before large
+    allocations (pinned host memory included): affinity and memory policy
+    are inherited by threads created afterwards.  Inside Docker,
+    ``set_mempolicy`` needs ``--cap-add SYS_NICE``.
+    """
+    out = {}
+    if cpus:
+        os.sched_setaffinity(0, parse_cpulist(cpus))
+        out["cpus"] = sorted(os.sched_getaffinity(0))
+    if node is not None:
+        if platform.machine() != "x86_64":
+            raise OSError("--membind-node is implemented for x86_64 only")
+        libc = ctypes.CDLL(None, use_errno=True)
+        words = _MAX_NODES // (8 * ctypes.sizeof(ctypes.c_ulong))
+        mask = (ctypes.c_ulong * words)()
+        bits = 8 * ctypes.sizeof(ctypes.c_ulong)
+        mask[node // bits] |= 1 << (node % bits)
+        if (
+            libc.syscall(_SYS_SET_MEMPOLICY, _MPOL_BIND, mask, _MAX_NODES + 1)
+            != 0
+        ):
+            err = ctypes.get_errno()
+            raise OSError(
+                err,
+                f"set_mempolicy(MPOL_BIND, node {node}) failed: {os.strerror(err)}",
+            )
+        mode = ctypes.c_int(-1)
+        got = (ctypes.c_ulong * words)()
+        if (
+            libc.syscall(
+                _SYS_GET_MEMPOLICY,
+                ctypes.byref(mode),
+                got,
+                _MAX_NODES + 1,
+                None,
+                0,
+            )
+            == 0
+        ):
+            out["mempolicy"] = {
+                "mode": "MPOL_BIND" if mode.value == _MPOL_BIND else mode.value,
+                "nodes": [
+                    i
+                    for i in range(_MAX_NODES)
+                    if got[i // bits] >> (i % bits) & 1
+                ],
+            }
     return out

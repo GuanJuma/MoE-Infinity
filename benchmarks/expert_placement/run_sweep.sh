@@ -81,26 +81,32 @@ CPU_THREADS="${CPU_THREADS:-$n_phys}"
 export OMP_NUM_THREADS="$CPU_THREADS"
 echo "GPU NUMA node ${NUMA_NODE}; ${n_phys} physical cores (${phys}); ${CPU_THREADS} CPU threads"
 
+PYBIND=()
 if command -v numactl >/dev/null 2>&1 && numactl --membind="$NUMA_NODE" true 2>/dev/null; then
     BIND=(numactl --physcpubind="$phys" --membind="$NUMA_NODE")
 else
-    echo "WARNING: numactl missing or set_mempolicy denied (needs --cap-add SYS_NICE);" \
-        "falling back to taskset without memory binding" >&2
-    BIND=(taskset -c "$phys")
+    # No numactl (offline image): bind inside the process instead
+    # (sched_setaffinity + set_mempolicy, needs --cap-add SYS_NICE).
+    echo "numactl unavailable; binding in-process (--cpu-bind/--membind-node)" >&2
+    BIND=(env)
+    PYBIND=(--cpu-bind "$phys" --membind-node "$NUMA_NODE")
 fi
 
 COMMON=(--model-dir "$MODEL_DIR" --layer "$LAYER" --expert "$EXPERT" --cpu-threads "$CPU_THREADS"
         --precision "$PRECISION" --fetch-modes "$FETCH_MODES")
+RUNARGS=("${COMMON[@]}" "${PYBIND[@]}")
 cd "$REPO"
 python3 "$BENCH/expert_placement_bench.py" "${COMMON[@]}" --list-experts | tee "$OUT/list_experts.txt"
 if [ "${SKIP_DRY_RUN:-0}" != "1" ]; then
-    "${BIND[@]}" python3 "$BENCH/expert_placement_bench.py" "${COMMON[@]}" --dry-run \
+    "${BIND[@]}" python3 "$BENCH/expert_placement_bench.py" "${RUNARGS[@]}" --dry-run \
         --scenarios "$SCENARIOS" --gpu-kernels "$GPU_KERNELS" --cpu-kernels "$CPU_KERNELS" \
         --out-dir "$OUT/dry_run" "$@" 2>&1 | tee "$OUT/dry_run.log"
 fi
-"${BIND[@]}" python3 "$BENCH/expert_placement_bench.py" "${COMMON[@]}" \
+"${BIND[@]}" python3 "$BENCH/expert_placement_bench.py" "${RUNARGS[@]}" \
     --tokens "$TOKENS" --scenarios "$SCENARIOS" --gpu-kernels "$GPU_KERNELS" \
     --cpu-kernels "$CPU_KERNELS" --repeats "$REPEATS" --idle-mib "$IDLE_MIB" \
     --out-dir "$OUT" "$@" 2>&1 | tee "$OUT/run.log"
+# Plots need matplotlib; without it the summary is Markdown only (plot the
+# CSV/JSON locally with the same script).
 python3 "$BENCH/summarize_placement.py" "$OUT" > /dev/null || true
 echo "results: $OUT/{results.csv,results.json,summary.md,*.png}"

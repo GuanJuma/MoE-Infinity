@@ -897,6 +897,17 @@ def parse_args(argv=None):
         default=2000,
         help="'busy' threshold for memory.used",
     )
+    p.add_argument(
+        "--cpu-bind",
+        default=None,
+        help="CPU list to pin this process to (numactl-free alternative)",
+    )
+    p.add_argument(
+        "--membind-node",
+        type=int,
+        default=None,
+        help="bind memory to this NUMA node via set_mempolicy (numactl-free alternative)",
+    )
     p.add_argument("--skip-amx-check", action="store_true")
     p.add_argument("--skip-pcie-probe", action="store_true")
     p.add_argument(
@@ -984,6 +995,9 @@ def print_inspection(info):
 
 def run(args) -> int:
     t_start = time.perf_counter()
+    numa_bind = bench_env.bind_numa(args.cpu_bind, args.membind_node)
+    if numa_bind:
+        print(f"in-process NUMA binding: {numa_bind}")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise KernelUnavailable(
@@ -1035,6 +1049,7 @@ def run(args) -> int:
     print(f"output -> {out_dir}")
 
     env = bench_env.collect(out_dir, device, args.cpu_threads)
+    env["numa_bind"] = numa_bind or None
     warnings = []
     if device.type == "cpu":
         warnings.append(
