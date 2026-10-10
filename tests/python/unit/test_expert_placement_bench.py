@@ -1073,6 +1073,15 @@ def test_pinning_env_and_numa_maps_fallback():
     assert env.numa_maps_nodes(0x10, maps) == {}
 
 
+def test_allowed_cpus_ignores_master_thread_binding():
+    env = importlib.import_module("bench_env")
+    pe = env.pinning_env([4, 5, 6, 7])
+    assert env.allowed_cpus(pe) == {4, 5, 6, 7}
+    own = set(os.sched_getaffinity(0))
+    assert env.allowed_cpus({"EP_ALLOWED_CPUS": "4-7"}) == own
+    assert env.allowed_cpus({}) == own
+
+
 def test_direct_run_reexecs_pinned(monkeypatch):
     env = importlib.import_module("bench_env")
     calls = {}

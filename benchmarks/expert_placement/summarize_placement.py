@@ -70,8 +70,14 @@ def header(result) -> list:
         f"- GPU: {gpu.get('name', '-')} {gpu.get('capability', '')}; "
         f"torch {env['versions'].get('torch')} CUDA {env['versions'].get('torch_cuda')}; "
         f"sglang {env['versions'].get('sglang')}; triton {env['versions'].get('triton')}",
-        f"- CPU threads: {cpu.get('torch_threads')} (allowed CPUs {cpu.get('affinity_cpus')}, "
-        f"{cpu.get('Cpus_allowed_list', '-')}; cpuset mems {cpu.get('Mems_allowed_list', '-')}; "
+        f"- CPU threads: {cpu.get('torch_threads')} (allowed CPUs "
+        f"{(env.get('host_setup') or {}).get('allowed_cpus') or cpu.get('affinity_cpus')}"
+        + (
+            "; OpenMP pinned one thread per core"
+            if (env.get("host_setup") or {}).get("omp_pinning")
+            else f", {cpu.get('Cpus_allowed_list', '-')}"
+        )
+        + f"; cpuset mems {cpu.get('Mems_allowed_list', '-')}; "
         f"mempolicy {_mempol(env)}); "
         f"ONEDNN_MAX_CPU_ISA={env.get('env', {}).get('ONEDNN_MAX_CPU_ISA', '-')}; "
         f"amx_selfcheck={_amx(env.get('amx_selfcheck'))}"

@@ -1089,11 +1089,7 @@ def prepare_host(args):
     if args.cpu_threads > 0:
         torch.set_num_threads(args.cpu_threads)
     pinned = bench_env.omp_pinned()
-    if pinned and os.environ.get("EP_ALLOWED_CPUS"):
-        # libgomp has bound this (master) thread to one place already.
-        allowed = bench_env.parse_cpulist(os.environ["EP_ALLOWED_CPUS"])
-    else:
-        allowed = os.sched_getaffinity(0)
+    allowed = bench_env.allowed_cpus()
     phys = bench_env.physical_cores(allowed)
     setup["omp_pinning"] = {
         k: os.environ.get(k)

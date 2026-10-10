@@ -135,7 +135,7 @@ def gpu_facts(device: torch.device) -> dict:
 def cpu_facts(threads: int) -> dict:
     from_aff = None
     try:
-        from_aff = len(os.sched_getaffinity(0))
+        from_aff = len(allowed_cpus())
     except AttributeError:
         pass
     d = {
@@ -172,7 +172,7 @@ def l3_bytes() -> Optional[int]:
     AMD has one L3 per 8-core CCD, so cpu0's index3 alone is a fraction)."""
     seen, total = set(), 0
     try:
-        cpus = sorted(os.sched_getaffinity(0))
+        cpus = sorted(allowed_cpus())
     except AttributeError:
         cpus = [0]
     for c in cpus:
@@ -591,6 +591,16 @@ def pinning_env(cores, threads: Optional[int] = None) -> Dict[str, str]:
         "OMP_NUM_THREADS": str(n),
         "EP_ALLOWED_CPUS": ",".join(map(str, cores[:n])),
     }
+
+
+def allowed_cpus(env=None) -> set:
+    """CPUs the run may use.  Once libgomp pins its places, the main thread
+    (and anything it starts later) is bound to the first place only, so its
+    own affinity no longer describes the process."""
+    env = os.environ if env is None else env
+    if omp_pinned(env) and env.get("EP_ALLOWED_CPUS"):
+        return parse_cpulist(env["EP_ALLOWED_CPUS"])
+    return set(os.sched_getaffinity(0))
 
 
 def numa_maps_nodes(addr: int, text: Optional[str] = None) -> dict:
