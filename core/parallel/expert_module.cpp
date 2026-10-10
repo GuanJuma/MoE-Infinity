@@ -7,6 +7,7 @@
 #include "utils/cuda_utils.h"
 #include "utils/logger.h"
 #include "kernel/fused_moe_mlp.h"
+#include "model/batchgen_moe.h"
 
 void mxfp4_dequant_cuda(const void* packed, const void* scales, void* output,
                         int rows, int packed_cols, int scale_cols,
@@ -340,6 +341,21 @@ void MoEMLP::ForwardHelper(cudaStream_t stream) {
 
     auto& gate_out = buffer_[2];
     auto& fused_out = buffer_[3];
+
+    if (batchgen::GetExpertKernel() == batchgen::ExpertKernel::kBatchGen) {
+      // forward() narrowed the scratch views to this batch; BatchGen needs
+      // [M, 2I] for the packed gate/up result, so hand it full capacity.
+      auto full_capacity = [](const torch::Tensor& buffer) {
+        return torch::from_blob(buffer.data_ptr(), {kMaxTokens, buffer.size(1)},
+                                DoNothingDeleter<void>{}, buffer.options());
+      };
+      auto gate_up_scratch = full_capacity(gate_out);
+      auto act_scratch = full_capacity(fused_out);
+      if (batchgen::ExpertFFN(input, gate_proj, up_proj, down_proj,
+                              gate_up_scratch, act_scratch, output, stream)) {
+        return;
+      }
+    }
 
     fused_moe_ffn_into(input, gate_proj, up_proj, down_proj, gate_out,
                        fused_out, output, stream);
