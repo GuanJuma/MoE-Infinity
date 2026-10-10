@@ -162,6 +162,35 @@ class ArcherConfig:
             )
         },
     )
+    cpu_experts: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Experts computed on the CPU instead of being fetched to GPU. "
+                "None follows MOE_CPU_EXPERTS (unset = none). Spec: 'all', "
+                "expert ids for every MoE layer ('0-7,12'), 'ratio:0.25' "
+                "(top quarter of expert ids), or per layer '3:0-7;5:1,2'. "
+                "Needs an x86 CPU with AVX512-BF16 (AMX recommended) and "
+                "dense BF16/FP16 expert weights in the checkpoint."
+            )
+        },
+    )
+    cpu_expert_quant: str = field(
+        default="bf16",
+        metadata={
+            "help": (
+                "Weight format of CPU-computed experts: 'bf16', 'int8_w8a8' "
+                "(per-channel INT8 weights, dynamic INT8 activations) or "
+                "'fp8_w8a16' (128x128 block FP8 weights, BF16 compute)."
+            )
+        },
+    )
+    cpu_expert_threads: int = field(
+        default=0,
+        metadata={
+            "help": "Threads for CPU expert compute (0 = torch default)."
+        },
+    )
     expert_drop_policy: str = field(
         default="off",
         metadata={
@@ -658,6 +687,15 @@ class ArcherConfig:
             raise ValueError(
                 "expert_kernel must be None, 'default' or 'batchgen', "
                 f"got {self.expert_kernel!r}"
+            )
+        if self.cpu_expert_quant not in ("bf16", "int8_w8a8", "fp8_w8a16"):
+            raise ValueError(
+                "cpu_expert_quant must be 'bf16', 'int8_w8a8' or 'fp8_w8a16', "
+                f"got {self.cpu_expert_quant!r}"
+            )
+        if self.cpu_expert_threads < 0:
+            raise ValueError(
+                f"cpu_expert_threads must be >= 0, got {self.cpu_expert_threads}"
             )
         if self.expert_drop_policy not in ("off", "on_miss"):
             raise ValueError(

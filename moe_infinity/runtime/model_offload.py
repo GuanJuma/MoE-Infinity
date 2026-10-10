@@ -871,6 +871,45 @@ class OffloadEngine(object):
         """Register a KVCacheManager for KV cache offloading."""
         self._kv_cache_manager = manager
 
+    def _setup_cpu_experts(self):
+        spec = getattr(self.archer_config, "cpu_experts", None)
+        if spec is None:
+            spec = os.environ.get("MOE_CPU_EXPERTS", "")
+        if not spec:
+            return
+        from moe_infinity.runtime.cpu_experts import (
+            CpuExpertBackend,
+            CpuExpertPlacement,
+        )
+
+        layer_ids = [m.layer_id for m in self.expert_layer_modules]
+        placement = CpuExpertPlacement.from_spec(
+            spec, layer_ids, self.num_experts
+        )
+        if len(placement) == 0:
+            return
+        if not self.ckpt_files:
+            raise RuntimeError(
+                "cpu_experts needs the HF safetensors checkpoint (ckpt_files) "
+                "to build host copies of the CPU-placed experts"
+            )
+        backend = CpuExpertBackend(
+            placement,
+            quant=self.archer_config.cpu_expert_quant,
+            num_threads=self.archer_config.cpu_expert_threads,
+        )
+        loaded = backend.load_from_safetensors(
+            self.ckpt_files, lambda name: parse_expert_id(name, self.config)
+        )
+        self.expert_executor.set_cpu_expert_backend(backend)
+        logger.info(
+            "CPU experts: %d experts over %d layers (%s, %.1f MiB host)",
+            loaded,
+            len(placement.cpu_experts),
+            backend.quant.value,
+            backend.host_bytes / 2**20,
+        )
+
     def deliver_fp8_scales_to_dispatcher(self):
         scales = getattr(self, "_blockwise_fp8_scales", None)
         if not scales:
@@ -1540,6 +1579,7 @@ class OffloadEngine(object):
 
                 self.setup_archer_hooks(model)
                 self.deliver_fp8_scales_to_dispatcher()
+                self._setup_cpu_experts()
                 extension_names = {
                     name
                     for name in ("_marlin", "_v4_fp4")
