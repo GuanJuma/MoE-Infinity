@@ -74,6 +74,10 @@ class StoreUnavailable(RuntimeError):
     pass
 
 
+class StoreError(RuntimeError):
+    """A call would trip a native DLOG_FATAL (abort()); raised instead."""
+
+
 def load_store_lib(name: str = "moe_infinity._store"):
     try:
         return importlib.import_module(name)
@@ -117,6 +121,9 @@ class MoEInfinityExpertStore:
         t0 = time.perf_counter()
         self.h = self.lib.prefetch_handle(str(self.dir), device_memory_ratio)
         self.nodes: Dict[str, NodeHandle] = {}
+        # Python mirror of ArcherTensorHandle::tensor_to_id_ (data_ptr -> id).
+        self._ptr_ids: Dict[int, int] = {}
+        self.broken: Optional[str] = None
         tid = 0
 
         def put(t: torch.Tensor):
@@ -124,12 +131,18 @@ class MoEInfinityExpertStore:
             t = t.detach().contiguous().cpu()
             if not self.h.is_tensor_offloaded(tid):
                 self.h.offload(t, tid)
-            # OffloadEngine registers ``param.data`` (an alias owned by the
-            # store) and passes ``param`` itself to begin/end; mirror that.
-            reg = torch.zeros(1, dtype=t.dtype)
+            # Exactly what OffloadEngine does: register ``param.data`` (an
+            # alias that shares param's data_ptr and that the store re-points)
+            # and pass ``param`` itself to begin/end.  begin/end look the
+            # buffer up by data_ptr in tensor_to_id_ (UpdateTensorMap) and
+            # abort() if it is unknown, so param must start at the registered
+            # pointer.
+            param = torch.zeros(1, dtype=t.dtype)
+            reg = param.data
             self.h.register(reg, tid)
+            self._ptr_ids.setdefault(param.data_ptr(), tid)
             tid += 1
-            return tid - 1, reg, torch.zeros(1, dtype=t.dtype)
+            return tid - 1, reg, param
 
         dense_in = put(torch.zeros(1024, dtype=torch.bfloat16))[0]
         groups = []
@@ -188,19 +201,33 @@ class MoEInfinityExpertStore:
 
     # -- moves (the runtime's own entry points) ----------------------------------
 
+    def _hook(self, fn, param: torch.Tensor, tid: int) -> None:
+        """Call begin/end the way the forward hooks do, keeping the
+        tensor_to_id_ mirror; refuse calls the engine would abort() on."""
+        if self.broken:
+            raise StoreError(f"MoE-Infinity store unusable: {self.broken}")
+        old = param.data_ptr()
+        if self._ptr_ids.get(old) != tid:
+            self.broken = (
+                f"tensor {tid}: buffer data_ptr {old:#x} is not registered for it in "
+                f"tensor_to_id_ (would hit DLOG_FATAL in UpdateTensorMap)"
+            )
+            raise StoreError(self.broken)
+        fn(self.request_id, param, tid)
+        self._ptr_ids.pop(old, None)
+        self._ptr_ids[param.data_ptr()] = tid
+
     def fetch(self, name: str) -> None:
         """Demand fetch via the pre-forward hook path (``begin``)."""
         n = self.nodes[name]
-        rid = self.request_id
         for k, tid in zip(n.order, n.tensor_ids):
-            self.h.begin(rid, n.params[k], tid)
+            self._hook(self.h.begin, n.params[k], tid)
 
     def release(self, name: str) -> None:
         """Post-forward hook (``end``); the node stays cached on the GPU."""
         n = self.nodes[name]
-        rid = self.request_id
         for k, tid in zip(n.order, n.tensor_ids):
-            self.h.end(rid, n.params[k], tid)
+            self._hook(self.h.end, n.params[k], tid)
         self.request_id += 1
 
     def prefetch(self, name: str, timeout_s: float = 10.0) -> None:

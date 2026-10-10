@@ -1322,30 +1322,59 @@ def run(args) -> int:
             if device.type == "cuda":
                 torch.cuda.synchronize()
 
-    for M in sweep:
-        if "gpu_resident" in scenarios:
-            for k, r in gpu_runners.items():
-                guard(f"gpu_resident/{k}/M={M}", bench.gpu_resident, r, M)
-        if "cpu_compute" in scenarios:
-            for k, r in cpu_runners.items():
-                guard(f"cpu_compute/{k}/M={M}", bench.cpu_compute, r, M)
-        if want_fetch:
-            for k in gpu_runners:
-                for m in fetch_modes:
+    # MoE-Infinity rows run last and results are written after every row: a
+    # native DLOG_FATAL abort()s the process, and must not cost the other
+    # scenarios' data.
+    def phase(rows):
+        for stage, f, *a in rows:
+            guard(stage, f, *a)
+            write_outputs(out_dir, result)
+
+    if "gpu_resident" in scenarios:
+        phase(
+            (f"gpu_resident/{k}/M={M}", bench.gpu_resident, r, M)
+            for M in sweep
+            for k, r in gpu_runners.items()
+        )
+    if "cpu_compute" in scenarios:
+        phase(
+            (f"cpu_compute/{k}/M={M}", bench.cpu_compute, r, M)
+            for M in sweep
+            for k, r in cpu_runners.items()
+        )
+    if want_fetch:
+        raw = [m for m in fetch_modes if m.startswith("raw_")]
+        phase(
+            (
+                f"cpu_store_gpu_compute/{k}+{m}/M={M}",
+                bench.raw_fetch,
+                gpu_runners[k],
+                host_copies[(k, m[4:])],
+                m[4:],
+                M,
+            )
+            for M in sweep
+            for k in gpu_runners
+            for m in raw
+        )
+        for M in sweep:
+            for k in mi_runners:
+                for m in (m for m in fetch_modes if m.startswith("mi_")):
                     stage = f"cpu_store_gpu_compute/{k}+{m}/M={M}"
-                    if m.startswith("raw_"):
-                        hm = m[4:]
-                        guard(
-                            stage,
-                            bench.raw_fetch,
-                            gpu_runners[k],
-                            host_copies[(k, hm)],
-                            hm,
-                            M,
+                    if bench.store.broken:
+                        result["errors"].append(
+                            {
+                                "stage": stage,
+                                "error": f"skipped: {bench.store.broken}",
+                            }
                         )
-                    elif k in mi_runners:
-                        guard(stage, bench.mi_fetch, mi_runners[k], m, M)
-        write_outputs(out_dir, result)
+                        continue
+                    guard(stage, bench.mi_fetch, mi_runners[k], m, M)
+                    write_outputs(out_dir, result)
+        if bench.store is not None and bench.store.broken:
+            msg = f"MoE-Infinity rows skipped after: {bench.store.broken}"
+            result["warnings"].append(msg)
+            print(f"WARNING: {msg}", flush=True)
 
     if device.type == "cuda":
         others = bench_env.other_gpu_processes(device)

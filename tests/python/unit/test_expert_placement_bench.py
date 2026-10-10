@@ -813,3 +813,90 @@ def test_in_process_numa_binding():
         )
     assert p.returncode == 0 and "ok" in p.stdout, p.stderr
     assert env.parse_cpulist("0-2,5, 7-8") == {0, 1, 2, 5, 7, 8}
+
+
+# -- regression: begin()/end() buffers must be the registered data_ptr ---------------
+
+
+def test_begin_buffer_is_registered_pointer_like_offload_engine(tmp_path):
+    """The first GPU run aborted in UpdateTensorMap ("Tensor 0x... not found
+    in tensor_to_id_"): the harness passed begin() a placeholder whose
+    data_ptr was never registered.  OffloadEngine registers ``param.data``
+    and hands ``param`` (same data_ptr) to begin/end."""
+    a = {
+        "w13": torch.randn(64, 32).to(torch.float8_e4m3fn),
+        "s": torch.tensor(0.5),
+    }
+    b = {k: v.clone() for k, v in a.items()}
+    st = mi_store.MoEInfinityExpertStore(
+        tmp_path / "s", {"a": a, "b": b}, lib=fake_mi
+    )
+    h = st.h
+    for n in st.nodes.values():
+        for k, tid in zip(n.order, n.tensor_ids):
+            assert h.tensor_to_id[n.params[k].data_ptr()] == tid
+    for _ in range(3):
+        st.fetch("a")
+        st.release("a")
+        st.evict_all()
+        st.fetch("b")
+        st.release("b")
+        st.evict_all()
+    assert st._ptr_ids == h.tensor_to_id
+    # The pre-fix pattern (an unregistered buffer) is what the engine aborts on.
+    with pytest.raises(fake_mi.FakeFatal, match="not found in tensor_to_id_"):
+        h.begin(
+            0,
+            torch.zeros(1, dtype=torch.float8_e4m3fn),
+            st.nodes["a"].tensor_ids[0],
+        )
+    st.close()
+
+
+def test_store_refuses_calls_the_engine_would_abort_on(tmp_path):
+    a = {"w13": torch.randn(64, 32).to(torch.float8_e4m3fn)}
+    st = mi_store.MoEInfinityExpertStore(
+        tmp_path / "s",
+        {"a": a, "b": {k: v.clone() for k, v in a.items()}},
+        lib=fake_mi,
+    )
+    st.nodes["a"].params["w13"].data = torch.zeros(1, dtype=torch.float8_e4m3fn)
+    n_calls = len(fake_mi.CALLS)
+    with pytest.raises(mi_store.StoreError, match="not registered"):
+        st.fetch("a")
+    assert all(
+        c[0] != "begin" for c in fake_mi.CALLS[n_calls:]
+    )  # never reached C++
+    with pytest.raises(mi_store.StoreError, match="unusable"):
+        st.fetch("b")
+    st.close()
+
+
+def test_broken_store_fails_soft_and_keeps_other_scenarios(
+    ckpts, tmp_path, monkeypatch
+):
+    orig = mi_store.MoEInfinityExpertStore.__init__
+
+    def broken_init(self, *a, **kw):
+        orig(self, *a, **kw)
+        for n in self.nodes.values():
+            for p in n.params.values():
+                p.data = torch.zeros(1, dtype=p.dtype)  # pre-fix state
+
+    monkeypatch.setattr(
+        mi_store.MoEInfinityExpertStore, "__init__", broken_init
+    )
+    cpu_k = "sglang_fp8_w8a16" if CPU_MOE else "torch_bf16"
+    res = _main_ok(
+        ["--model-dir", str(ckpts["hy3_fp8"]), "--tokens", "1,4",
+         "--gpu-kernels", "torch_scaled_mm", "--cpu-kernels", cpu_k, *COMMON],
+        tmp_path / "soft",
+    )  # fmt: skip
+    variants = {(r["scenario"], r["variant"]) for r in res["rows"]}
+    assert ("gpu_resident", "torch_scaled_mm") in variants
+    assert ("cpu_compute", cpu_k) in variants
+    assert ("cpu_store_gpu_compute", "torch_scaled_mm+raw_pinned") in variants
+    assert not any("+mi_" in v for _, v in variants)
+    mi_errs = [e for e in res["errors"] if "+mi_" in e["stage"]]
+    assert len(mi_errs) == 2 * 3 and "tensor_to_id_" in mi_errs[0]["error"]
+    assert any("MoE-Infinity rows skipped" in w for w in res["warnings"])

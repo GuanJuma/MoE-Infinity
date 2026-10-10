@@ -9,7 +9,9 @@ host buffer and re-points the registered tensors at it
 (SetModuleMemoryFromDisk_Views); ``begin`` fetches the node (evicting other
 cached experts above the cache limit, RemoveCachedSparseNode) and points the
 caller's buffer at the store tensor (SetTensor); ``end`` points the caller's
-buffer at a 1-element placeholder (ReleaseTensor); ``prefetch_tensors``
+buffer at a 1-element placeholder (ReleaseTensor); both then re-key
+``tensor_to_id_`` by data_ptr (UpdateTensorMap) and raise ``FakeFatal`` where
+the real engine would abort() on an unregistered pointer; ``prefetch_tensors``
 moves the node; ``resize_expert_cache`` evicts down to the target and keeps
 it as the cache limit.  "Device" memory is a fresh CPU clone so that tensor
 addresses change on every move, like the real device pool.
@@ -21,6 +23,10 @@ import torch
 
 CALLS = []
 INSTANCES = []
+
+
+class FakeFatal(RuntimeError):
+    """Stands in for DLOG_FATAL, which abort()s the real process."""
 
 
 class _Node:
@@ -45,6 +51,7 @@ class prefetch_handle:  # noqa: N801 - mirrors the pybind class name
         self.h2d = 0
         self.closed = False
         self.topology = None
+        self.tensor_to_id = {}  # ArcherTensorHandle::tensor_to_id_
         INSTANCES.append(self)
 
     def _log(self, *a):
@@ -62,6 +69,14 @@ class prefetch_handle:  # noqa: N801 - mirrors the pybind class name
         self._log("register", tid)
         assert tid in self.data, "register before offload"
         self.reg[tid] = t
+        self.tensor_to_id.setdefault(t.data_ptr(), tid)
+
+    def _update_tensor_map(self, old, new):
+        # ArcherTensorHandle::UpdateTensorMap: DLOG_FATAL -> abort() natively.
+        if old not in self.tensor_to_id:
+            raise FakeFatal(f"Tensor {old:#x} not found in tensor_to_id_")
+        tid = self.tensor_to_id.pop(old)
+        self.tensor_to_id[new] = tid
 
     def set_topology_v2(self, specs):
         self._log("set_topology_v2", len(specs))
@@ -110,12 +125,16 @@ class prefetch_handle:  # noqa: N801 - mirrors the pybind class name
     def begin(self, request_id, buffer, tid):
         self._log("begin", tid)
         n = self.node_of[tid]
+        old = buffer.data_ptr()
         self._fetch(n)
         buffer.data = self.reg[tid]
+        self._update_tensor_map(old, buffer.data_ptr())
 
     def end(self, request_id, buffer, tid):
         self._log("end", tid)
+        old = buffer.data_ptr()
         buffer.data = torch.zeros(1, dtype=buffer.dtype)
+        self._update_tensor_map(old, buffer.data_ptr())
 
     def prefetch_tensors(self, tensor_ids, priority=1, phase=2):
         self._log("prefetch_tensors", tuple(tensor_ids))
