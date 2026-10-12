@@ -1,0 +1,40 @@
+# tokenhub_bench hardware axis: Hy3-FP8 on MoE-Infinity (python -m moe_infinity.hy3.server).
+# Copy to <tokenhub_bench>/configs/hardware/. Batch size 1, no prefix cache
+# (cached_tokens is always 0), no --api-key (wrong/missing keys return 200).
+
+id: moe-infinity-hy3
+device_class: nvidia-rtx-pro-5000
+device:
+  vendor: NVIDIA
+  sku: RTX PRO 5000 (72 GB, sm_120), 1 GPU, experts offloaded to host memory
+  note: MoE-Infinity Hy3 engine; model id /model; serves one request at a time
+engine: custom
+
+endpoint:
+  name: moe-infinity-hy3
+  base_url: ${TOKENHUB_BASE_URL:-http://127.0.0.1:30000/v1}
+  api_key: ${TOKENHUB_API_KEY:-EMPTY}
+  model: ${TOKENHUB_MODEL:-/model}
+  timeout_s: 3600
+
+protocols:
+  chat_completions: true
+  responses: false
+  anthropic_messages: false
+
+cache:
+  mode: none
+  explicit_cache_supported: false
+  min_prefix_tokens: 256
+  cached_tokens_paths:
+    - usage.prompt_tokens_details.cached_tokens
+
+auth:
+  invalid_key_status: 200
+  missing_auth_status: 200
+
+web_search:
+  supported: false
+
+error_body_must_not_contain:
+  - vendor
