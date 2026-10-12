@@ -292,33 +292,88 @@ def test_server_roundtrip(ckpt_dir, tmp_path):
     assert len(list((tmp_path / "srv").glob("*.pt"))) == 2
 
 
-def test_preflight(tmp_path):
-    from moe_infinity.hy3.cli import preflight
-
+def _fake_host(tmp_path, nodes):
     proc, sysfs = tmp_path / "proc", tmp_path / "node"
     (proc / "self").mkdir(parents=True)
-    (proc / "meminfo").write_text(f"MemAvailable:   {600 * 2**20} kB\n")
-    (proc / "self" / "status").write_text("Mems_allowed_list:\t0\n")
-    (sysfs / "node0").mkdir(parents=True)
-    (sysfs / "node0" / "meminfo").write_text(
-        f"Node 0 MemFree:   {300 * 2**20} kB\n"
-        f"Node 0 Inactive(file):  {100 * 2**20} kB\n"
+    (proc / "meminfo").write_text(f"MemAvailable:   {2000 * 2**20} kB\n")
+    ids = ",".join(str(n) for n in nodes)
+    (proc / "self" / "status").write_text(f"Mems_allowed_list:\t{ids}\n")
+    for n, (free, inactive) in nodes.items():
+        (sysfs / f"node{n}").mkdir(parents=True)
+        (sysfs / f"node{n}" / "meminfo").write_text(
+            f"Node {n} MemFree:   {free * 2**20} kB\n"
+            f"Node {n} Inactive(file):  {inactive * 2**20} kB\n"
+        )
+    return dict(proc=str(proc), sysfs=str(sysfs), min_gpu_free_gib=0)
+
+
+def test_preflight_single_node(tmp_path):
+    from moe_infinity.hy3.cli import preflight
+
+    host = _fake_host(tmp_path, {0: (300, 74)})
+    ok, lines = preflight(
+        str(tmp_path / "s"), min_ram_gib=500, min_disk_gib=0, **host
+    )
+    assert not ok and any(
+        "FAIL allowed NUMA" in x and "node0 374" in x for x in lines
     )
     ok, lines = preflight(
-        str(tmp_path / "store"),
-        min_ram_gib=500,
+        str(tmp_path / "s"), min_ram_gib=293, min_disk_gib=0, **host
+    )
+    assert ok, lines
+    assert not any(x.startswith("WARN") for x in lines)
+
+
+def test_preflight_two_nodes_sums_and_warns(tmp_path):
+    from moe_infinity.hy3.cli import preflight
+
+    host = _fake_host(tmp_path, {0: (150, 50), 1: (900, 0)})
+    ok, lines = preflight(
+        str(tmp_path / "s"),
+        min_ram_gib=293,
         min_disk_gib=0,
-        min_gpu_free_gib=0,
-        proc=str(proc),
-        sysfs=str(sysfs),
+        gpu_numa={0: 0},
+        **host,
     )
-    assert not ok  # node 0 has only 400 GiB free + reclaimable
-    assert lines[0].startswith("OK") and "600 GiB" in lines[0]
-    assert lines[1].startswith("FAIL") and "node0 400" in lines[1]
+    assert ok, lines
+    warn = [x for x in lines if x.startswith("WARN")]
+    assert warn and "inter-socket" in warn[0]
+    assert (
+        "GPU is on node 0" in warn[0]
+        and "93 GiB will live on a remote" in warn[0]
+    )
+
+
+def test_preflight_requirement_from_layout(tmp_path, ckpt_dir):
+    from moe_infinity.hy3.cli import (
+        HOST_HEADROOM_GIB,
+        PARTITION_GIB,
+        host_requirements,
+        preflight,
+    )
+
+    req = host_requirements(Hy3Checkpoint(ckpt_dir))
+    # tiny experts: 3 tensors of 2 KiB, each padded to the 4 KiB AIO block
+    assert req["mi_node_bytes"] == 3 * 4096
+    assert req["mi_pinned_host_gib"] == 16 * 3 * 4096 / 2**30
+    host = _fake_host(tmp_path, {0: (100, 0)})
     ok, lines = preflight(
-        str(tmp_path / "store"), 350, 0, 0, proc=str(proc), sysfs=str(sysfs)
+        str(tmp_path / "s"), model_dir=str(ckpt_dir), min_disk_gib=0, **host
     )
-    assert all(not ln.startswith("FAIL") for ln in lines[:3])
+    need = req["mi_pinned_host_gib"] + PARTITION_GIB + HOST_HEADROOM_GIB
+    assert ok and any(f"need >= {need:.0f}" in x for x in lines), lines
+
+
+def test_mi_store_restarts_interrupted_build(ckpt_dir, tmp_path):
+    d = tmp_path / "store"
+    d.mkdir()
+    (d / ".hy3_building").touch()
+    (d / "archer_param_0").write_bytes(b"partial")
+    fake_mi.CALLS.clear()
+    _engine(ckpt_dir, store="mi", offload_dir=str(d))
+    assert not (d / "archer_param_0").exists()
+    assert not (d / ".hy3_building").exists()
+    assert [c[0] for c in fake_mi.CALLS].count("offload") == 2 * 8 * 3 + 2
 
 
 def test_memory_plan(ckpt_dir):

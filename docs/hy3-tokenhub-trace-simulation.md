@@ -34,7 +34,7 @@ tokenhub's `cache_hit`), Belady/LRU/LFU over 4-128 GiB caches. tokenhub's
 the zip).
 
 ```bash
-python -m moe_infinity.hy3 preflight --offload-dir $STORE   # RAM >= 500 GiB, disk >= 300 GiB, GPU free
+python -m moe_infinity.hy3 preflight --offload-dir $STORE --model-dir /model  # RAM/disk from the layout, GPU free
 python -m moe_infinity.hy3 build-store --model-dir /model --offload-dir $STORE
 python -m moe_infinity.hy3 generate --model-dir /model --offload-dir $STORE
 python benchmarks/hy3_trace/run_tokenhub_traces.py --model-dir /model \
@@ -44,7 +44,12 @@ python benchmarks/hy3_trace/simulate_traces.py --traces $OUT/traces \
 ```
 
 `--store pinned` (pure PyTorch, 267 GiB pinned, no offload files) is the
-fallback if the native store fails.
+fallback if the native store fails. `preflight` sums free + reclaimable memory
+over the NUMA nodes the process may allocate from (e.g. `--cpuset-mems=0-1`)
+and warns when pinned experts would spill to a node other than the GPU's
+(cross-socket H2D). An interrupted store build is wiped and restarted: the
+native store reopens an index with its write cursor at partition 0, so
+appending would overwrite stored tensors.
 
 ## Why a dedicated Hy3 path
 
@@ -89,7 +94,7 @@ with `sequence_belady_cache_simulator.py`:
 | GPU expert cache `--expert-cache-gib 32` | 32 GiB = 1,820 of 15,168 experts (12%) |
 | Workspace + CUDA context (estimate) | ~5.5 GiB |
 | Routed experts, host (79 layers x 192 x 18 MiB FP8) | 266.6 GiB |
-| `--store mi` pinned host pool (torch rounds each 18 MiB node to 32 MiB) | 474 GiB |
+| `--store mi` pinned host pool (one exact-size `cudaHostAlloc` per expert node, MoE-Infinity's own HostCachingAllocator) | 266.6 GiB (+ one 10 GiB partition read buffer, transient) |
 | `--store mi` offload files on disk | 266.6 GiB |
 
 ## Verified

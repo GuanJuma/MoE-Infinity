@@ -10,8 +10,9 @@ Each routed expert is one store node holding the checkpoint's exact
 Stores (same interface: ``prefetch`` -> ``acquire`` -> ``release``):
 
 * :class:`MiExpertStore` -- ``moe_infinity._store``: the tensors are written
-  to MoE-Infinity's offload files once (reused on later runs), topology init
-  reads every expert node into the pinned host pool, ``begin`` fetches a
+  to MoE-Infinity's offload files once (reused on later runs; an interrupted
+  build starts over), topology init reads every expert node into the pinned
+  host pool (one exact-size ``cudaHostAlloc`` per node), ``begin`` fetches a
   node to the GPU through ``AcquireTensor``/``ArcherTaskPool``/
   ``Node::SetDevice`` (evicting other experts when the cache is full),
   ``prefetch_tensors`` enqueues async fetches, ``end`` releases.
@@ -341,6 +342,14 @@ class MiExpertStore(ExpertStoreBase):
                 f"{self.dir} is not empty and is not a Hy3 expert store; "
                 "use an empty --offload-dir"
             )
+        building = self.dir / ".hy3_building"
+        complete = old == manifest and not building.exists()
+        if has_files and not complete:
+            # Interrupted build.  The native store restarts its write cursor
+            # at partition 0 offset 0 when it reopens an index, so appending
+            # the missing tensors would overwrite stored ones: start over.
+            log(f"[hy3] mi store: {self.dir} is an unfinished build; wiping")
+            shutil.rmtree(self.dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         if lib is None:
             try:
@@ -357,16 +366,19 @@ class MiExpertStore(ExpertStoreBase):
         self.tid_in = 0
         self.tid_out = 1 + self.L * self.E * 3
         t0 = time.perf_counter()
-        complete = (
-            old == manifest
-            and self.h.is_tensor_offloaded(self.tid_out)
+        if complete and not (
+            self.h.is_tensor_offloaded(self.tid_out)
             and self.h.is_tensor_offloaded(self.tid(self.L - 1, self.E - 1, 2))
-        )
+        ):
+            raise RuntimeError(
+                f"{self.dir}: manifest present but the store index is "
+                "incomplete; pass --rebuild-store"
+            )
         if not complete:
-            (self.dir / ".hy3_building").touch()
+            building.touch()
             self._build(ckpt, log)
             mpath.write_text(json.dumps(manifest, indent=1))
-            (self.dir / ".hy3_building").unlink(missing_ok=True)
+            building.unlink(missing_ok=True)
             log(
                 f"[hy3] mi store: offload done ({time.perf_counter() - t0:.0f}s)"
             )
