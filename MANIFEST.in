@@ -1,5 +1,6 @@
 recursive-include core *.cpp *.h *.cc
 recursive-include extensions/kernel *.cu *.h
+recursive-include extensions/kernel/cpu *.cpp *.h LICENSE NOTICE
 
 # With setuptools-scm installed, the sdist file-finder defaults to including
 # every git-tracked file. Prune large directories that are not needed to build

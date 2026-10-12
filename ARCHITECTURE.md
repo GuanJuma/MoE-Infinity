@@ -28,7 +28,8 @@ it:
 - `core/`, the C++/CUDA offload engine (C++ in `core/**/*.cpp`, CUDA in
   `core/**/*.cu`, pybind bindings under `core/python/`).
 - `extensions/kernel/`, standalone CUDA kernels (fused MoE MLP, activation,
-  top-k softmax, paged attention, and the `v4_fp4/` FP4 dequant path).
+  top-k softmax, paged attention, and the `v4_fp4/` FP4 dequant path), plus
+  `cpu/`, the vendored SGLang x86 CPU MoE kernels built as `_cpu_moe.so`.
 
 These compile into the extension modules you see as `_engine.so`,
 `_kv_cache.so`, `_paged_attn.so`, `_store.so`, `_v4_fp4.so`, and `_marlin.so`
@@ -49,6 +50,9 @@ moe_infinity/
 │   ├── attention_backend.py   Attention backend dispatch (SDPA, FlashAttention,
 │   │                          FlashInfer where supported, fallback backend)
 │   ├── hooks.py               Forward-pass hooks for tracing and prefetching
+│   ├── cpu_experts.py         Per-expert CPU placement: CPU-placed experts are
+│   │                          split off in ExpertExecutor.dispatch_local and
+│   │                          computed on the host (MOE_CPU_EXPERTS)
 │   └── compile.py             Optional torch.jit compilation of expert MLPs
 │
 ├── models/              Model wrappers
@@ -120,6 +124,11 @@ moe_infinity/
 │   └── expert_prefetcher.py   DistributedExpertPrefetcher: cross-rank prefetch
 │
 ├── kernel/              Custom kernels (Triton / CUDA adapters)
+│   ├── cpu/                   CPU expert FFN on vendored SGLang kernels
+│   │                          (extensions/kernel/cpu, AMX/AVX512-BF16)
+│   ├── batchgen/              Vendored BatchGen MoE kernels + AOT cubin
+│   │                          build for the native expert FFN
+│   │                          (MOE_EXPERT_KERNEL=batchgen)
 │   ├── router.py              Fused softmax+topk router
 │   ├── sglang_adapter.py      sglang topk_softmax adapter
 │   └── paged_attention_ops.py Paged attention forward ops

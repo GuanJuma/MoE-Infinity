@@ -38,3 +38,11 @@ install(TARGETS prefetch_op
   LIBRARY DESTINATION "${CMAKE_SOURCE_DIR}/moe_infinity/ops/prefetch"
   COMPONENT Runtime
 )
+
+add_subdirectory(kernel/cpu)
+if(TARGET cpu_moe)
+  install(TARGETS cpu_moe
+    LIBRARY DESTINATION "${CMAKE_SOURCE_DIR}/moe_infinity"
+    COMPONENT Runtime
+  )
+endif()

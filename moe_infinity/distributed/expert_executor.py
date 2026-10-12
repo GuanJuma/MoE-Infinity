@@ -3,6 +3,7 @@
 
 # EfficientMoE Team
 
+import concurrent.futures
 from contextlib import nullcontext
 from typing import Any, cast
 
@@ -162,6 +163,8 @@ class DistributedExpertExecutor:
         self._drop_dev_stats = {}
         self._drop_dev_stats_by_layer = {}
         self.precision_policy = None
+        self.cpu_expert_backend = None
+        self._pending_cpu = None
         self.last_executor_evidence = _executor_evidence(
             wiring_reachable=True,
             fallback_reason="context_inactive",
@@ -169,6 +172,19 @@ class DistributedExpertExecutor:
 
     def set_precision_policy(self, precision_policy):
         self.precision_policy = precision_policy
+
+    def set_cpu_expert_backend(self, backend):
+        """Compute the experts ``backend.placement`` selects on the CPU.
+
+        See ``moe_infinity.runtime.cpu_experts``.
+        """
+        self.cpu_expert_backend = backend
+
+    def _cpu_placed(self, layer_id, device):
+        backend = self.cpu_expert_backend
+        if backend is None or not backend.has_layer(layer_id):
+            return None
+        return backend.placement.mask(layer_id).to(device)
 
     def set_expert_dispatcher(self, expert_dispatcher):
         global _expert_dispatcher
@@ -507,6 +523,9 @@ class DistributedExpertExecutor:
             resident = torch.ones(
                 num_experts, dtype=torch.bool, device=router_mask.device
             )
+        cpu_placed = self._cpu_placed(layer_id, resident.device)
+        if cpu_placed is not None:
+            resident = resident | cpu_placed
 
         if self._drop_select_compiled is None:
             self._drop_select_compiled = torch.compile(
@@ -611,6 +630,9 @@ class DistributedExpertExecutor:
         except Exception:
             self._expert_drop_stats["residency_unknown"] += 1
             resident = torch.ones(num_experts, dtype=torch.bool)
+        cpu_placed = self._cpu_placed(layer_id, resident.device)
+        if cpu_placed is not None:
+            resident = resident | cpu_placed
 
         try:
             mask, weights, counts = select_expert_drops(
@@ -732,6 +754,16 @@ class DistributedExpertExecutor:
         router_mask, router_weights, trace_ids = self._apply_expert_drop(
             layer_id, router_mask, router_weights
         )
+
+        self._pending_cpu = None
+        if self.cpu_expert_backend is not None:
+            # CPU-placed experts leave the GPU routing here, so the native
+            # dispatcher, prefetch correction and tracing never see them.
+            router_mask, router_weights, self._pending_cpu = (
+                self.cpu_expert_backend.submit(
+                    layer_id, hidden_states, router_mask, router_weights
+                )
+            )
 
         phase = current_expert_phase()
 
@@ -855,6 +887,8 @@ class DistributedExpertExecutor:
         self._pending_prefetch = None
         failure_safe = self._pending_prefetch_failure_safe
         self._pending_prefetch_failure_safe = False
+        pending_cpu = getattr(self, "_pending_cpu", None)
+        self._pending_cpu = None
 
         def _call_optional(target, name, *args, **kwargs):
             hook = getattr(target, name, None)
@@ -981,12 +1015,18 @@ class DistributedExpertExecutor:
                     try:
                         result = self.expert_dispatcher.wait_expert()
                     except BaseException:
+                        if pending_cpu is not None:
+                            concurrent.futures.wait([pending_cpu])
                         try:
                             finalize_policy(False)
                         except BaseException:
                             pass
                         raise
         finalize_policy(True)
+        if pending_cpu is not None:
+            from moe_infinity.runtime.cpu_experts import merge_cpu_result
+
+            result = merge_cpu_result(result, pending_cpu)
         return result
 
     def dispatch(self, hidden_states, router_mask, layer_id):
