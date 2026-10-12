@@ -47,6 +47,7 @@ prefetch/AIO and caching-allocator paths and are parsed with C `getenv`.
 | `MOE_IO_BLOCK_SIZE_KB` | `1024` (1 MiB) | `core/aio/archer_prio_aio_handle.cpp` static init | Read/transfer block size for the priority AIO path (in KB), which also sizes the pinned-memory pool blocks. | Only applied when the value is in `[256, 65536]` KB; any other value falls back to the 1 MiB default. |
 | `MOEINF_GPU_SIZE` | unset, full device memory | `core/memory/caching_allocator.h` allocator init (CUDA path) | Overrides the GPU caching-allocator capacity, in bytes. | Read via `std::stoull`. If unset, the allocator uses the device's total global memory (`cudaGetDeviceProperties`). |
 | `MOEINF_PIN_SIZE` | required (no default) | `core/memory/caching_allocator.h` allocator init (pinned path) | Sets the pinned-host caching-allocator capacity, in bytes. | Read via `std::stoull`. Unset trips a fatal log when the pinned allocator initializes, so set it when the pinned path is used. |
+| `MOE_EXPERT_KERNEL` | unset, treated as `"default"` | `core/model/batchgen_moe.cpp` first expert forward | `"batchgen"` runs the on-GPU FFN of fetched BF16 gated-SiLU experts (Mixtral, DeepSeek, Qwen3, OLMoE, ... types) on BatchGen's kernels; `"default"` keeps the CUTLASS fused MLP. Unsupported experts fall back to the default kernel per call. | Case-insensitive. `ArcherConfig.expert_kernel` overrides it when set. See [BatchGen expert kernels](batchgen-expert-kernels.md). |
 
 ## Model-specific toggles
 
@@ -66,6 +67,7 @@ For `CUDA_VISIBLE_DEVICES` ordering, expert ownership, and one-host multi-GPU be
 | `NVTX_DISABLE` | `"0"` | `setup.py` build | If `"1"`, compile out NVTX instrumentation macros. | Build-time only. |
 | `MOE_ENABLE_SM90` | `"1"` | `setup.py` build | Include sm_90 kernels in the compiled extensions. | Build-time only. |
 | `MOE_ENABLE_SM120` | `"0"` | `setup.py` build | Include sm_120 kernels and the native FP4 extension arch flags. | Build-time only. |
+| `MOE_BUILD_BATCHGEN` | unset (auto) | `setup.py` build | Embed AOT-compiled BatchGen expert-FFN cubins into `_store` for the enabled SM archs. Unset builds them when Triton can compile, `"1"` makes a failure fatal, `"0"` skips them. | Build-time only. CMake uses the `MOE_BUILD_BATCHGEN` option and the `MOE_BATCHGEN_ARCHS` cache variable instead. |
 
 The package version is not set via an environment variable; it is derived from
 git tags at build time by setuptools-scm (see `pyproject.toml`).
