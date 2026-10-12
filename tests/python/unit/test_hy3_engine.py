@@ -137,6 +137,18 @@ def test_fp8_compute_close(ckpt_dir, ref):
     assert rel < 0.15, rel
 
 
+@pytest.mark.parametrize("compute", ["bf16", "fp8"])
+def test_bfloat16_engine(ckpt_dir, ref, compute):
+    eng = _engine(ckpt_dir, dtype="bfloat16", expert_compute=compute)
+    assert {p.dtype for p in eng.model.parameters()} == {torch.bfloat16}
+    assert eng.moe_modules[0].e_score_correction_bias.dtype == torch.float32
+    with torch.no_grad():
+        logits = eng.model(input_ids=torch.tensor([PROMPT])).logits.float()
+    rel = (logits - ref["logits"]).norm() / ref["logits"].norm()
+    assert rel < 0.2, rel
+    assert eng.generate(PROMPT, max_new_tokens=3)["stats"]["completion_tokens"]
+
+
 def test_pinned_store_evicts_and_stays_exact(ckpt_dir, ref):
     eng = _engine(ckpt_dir)
     assert eng.store.n_slots == 9  # < 2 layers x 8 experts

@@ -144,7 +144,7 @@ class Hy3Engine:
             )
             self.moe_modules: List[Hy3OffloadMoE] = []
             for li, layer in enumerate(self.ckpt.moe_layers):
-                mod = Hy3OffloadMoE(self.config, layer, li)
+                mod = Hy3OffloadMoE(self.config, layer, li).to(self.dtype)
                 model.model.layers[layer].mlp = mod
                 self.moe_modules.append(mod)
         model.to_empty(device=self.device)
