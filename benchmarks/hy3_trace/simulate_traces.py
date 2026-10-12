@@ -22,7 +22,7 @@ simulator's CLI prints); ``global`` concatenates all requests in file order
     python benchmarks/hy3_trace/simulate_traces.py \
         --traces /scratch/$ME/hy3_traces/run1/traces \
         --sim-dir /scratch/$ME/archer-rel-simulation/simulation \
-        --capacity-gib 5 10 20 40 --out /scratch/$ME/hy3_traces/run1/sim
+        --out /scratch/$ME/hy3_traces/run1/sim
 """
 
 from __future__ import annotations
@@ -41,6 +41,8 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 
 Key = Tuple[int, int]
+# 32 GiB = the engine's default GPU expert cache (1,820 Hy3 experts).
+DEFAULT_CAPACITY_GIB = (4, 8, 16, 32, 64, 128)
 
 
 def find_traces(paths: Sequence[str]) -> List[Path]:
@@ -194,7 +196,8 @@ def main(argv=None):
         nargs="*",
         type=float,
         default=[],
-        help="cache sizes in GiB (expert size from trace meta)",
+        help="cache sizes in GiB (expert size from trace meta); default "
+        "4 8 16 32 64 128 when no size is given",
     )
     p.add_argument(
         "--ignore-layers",
@@ -241,7 +244,7 @@ def main(argv=None):
     for g in a.capacity_gib:
         caps.add(int(g * 2**30 // expert_bytes))
     if not caps:
-        caps = {int(g * 2**30 // expert_bytes) for g in (5, 10, 20, 40)}
+        caps = {int(g * 2**30 // expert_bytes) for g in DEFAULT_CAPACITY_GIB}
     caps = sorted(caps)
     sim, sim_src = load_sim(a.sim_dir)
     extract = sim.extract_access_sequence if sim else _extract

@@ -5,6 +5,7 @@
 
     python -m moe_infinity.hy3 inspect  --model-dir /model
     python -m moe_infinity.hy3 plan     --model-dir /model --expert-cache-gib 32
+    python -m moe_infinity.hy3 preflight --offload-dir D
     python -m moe_infinity.hy3 build-store --model-dir /model --offload-dir D
     python -m moe_infinity.hy3 generate --model-dir /model --offload-dir D \
         --prompt "你好" --max-new-tokens 16
@@ -149,6 +150,133 @@ def _cmd_plan(a):
     )
 
 
+def _parse_list(spec: str) -> list:
+    out = []
+    for part in spec.strip().split(","):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        out.extend(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+def _meminfo_kib(path: str, prefix: str = "") -> dict:
+    vals = {}
+    with open(path) as f:
+        for line in f:
+            line = line[len(prefix) :] if line.startswith(prefix) else line
+            key, _, rest = line.partition(":")
+            parts = rest.split()
+            if parts and parts[0].isdigit():
+                vals[key.strip()] = int(parts[0])
+    return vals
+
+
+def preflight(
+    offload_dir: str,
+    min_ram_gib: float = 500.0,
+    min_disk_gib: float = 300.0,
+    min_gpu_free_gib: float = 62.0,
+    proc: str = "/proc",
+    sysfs: str = "/sys/devices/system/node",
+) -> tuple:
+    """(ok, lines): host RAM (and the NUMA nodes this process may allocate
+    from), free disk for the offload store, free GPU memory."""
+    import os
+    import shutil
+    from pathlib import Path
+
+    from .experts import MANIFEST
+
+    lines, ok = [], True
+
+    def check(cond: bool, msg: str):
+        nonlocal ok
+        ok &= cond
+        lines.append(("OK   " if cond else "FAIL ") + msg)
+
+    mem = _meminfo_kib(f"{proc}/meminfo")
+    avail = mem.get("MemAvailable", 0) / 2**20
+    check(
+        avail >= min_ram_gib,
+        f"host MemAvailable {avail:.0f} GiB (need >= {min_ram_gib:.0f})",
+    )
+    nodes = []
+    try:
+        for line in open(f"{proc}/self/status"):
+            if line.startswith("Mems_allowed_list:"):
+                nodes = _parse_list(line.split(":", 1)[1])
+    except OSError:
+        pass
+    node_free = 0.0
+    seen = []
+    for n in nodes:
+        p = f"{sysfs}/node{n}/meminfo"
+        if not os.path.exists(p):
+            continue
+        v = _meminfo_kib(p, prefix=f"Node {n} ")
+        free = (v.get("MemFree", 0) + v.get("Inactive(file)", 0)) / 2**20
+        node_free += free
+        seen.append(f"node{n} {free:.0f}")
+    if seen:
+        check(
+            node_free >= min_ram_gib,
+            f"allowed NUMA nodes free+reclaimable {node_free:.0f} GiB "
+            f"({', '.join(seen)}; need >= {min_ram_gib:.0f}; pinned memory "
+            "comes from these nodes)",
+        )
+    d = Path(offload_dir)
+    built = (d / MANIFEST).exists() and not (d / ".hy3_building").exists()
+    probe = d
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    free_disk = shutil.disk_usage(probe).free / 2**30
+    if built:
+        lines.append(
+            f"OK   offload store already built in {d} "
+            f"({free_disk:.0f} GiB free on that disk)"
+        )
+    else:
+        check(
+            free_disk >= min_disk_gib,
+            f"free disk at {probe}: {free_disk:.0f} GiB "
+            f"(need >= {min_disk_gib:.0f} for the offload store)",
+        )
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                free, total = torch.cuda.mem_get_info(i)
+                check(
+                    free / 2**30 >= min_gpu_free_gib,
+                    f"cuda:{i} {torch.cuda.get_device_name(i)} free "
+                    f"{free / 2**30:.1f} / {total / 2**30:.1f} GiB "
+                    f"(need >= {min_gpu_free_gib:.0f})",
+                )
+        else:
+            check(False, "no CUDA device visible")
+    except Exception as e:  # noqa: BLE001
+        check(False, f"CUDA probe failed: {e!r}")
+    return ok, lines
+
+
+def _cmd_preflight(a):
+    ok, lines = preflight(
+        a.offload_dir, a.min_ram_gib, a.min_disk_gib, a.min_gpu_free_gib
+    )
+    for line in lines:
+        print(line)
+    print(
+        "\nNOTE: --store mi pins ~474 GiB of host RAM for the whole run "
+        "(released when the process exits) and writes ~267 GiB under the "
+        "offload dir. Tell the colleagues sharing this server before you "
+        "start, and stop the process when done."
+    )
+    print("\nPREFLIGHT " + ("PASSED" if ok else "FAILED"))
+    sys.exit(0 if ok else 1)
+
+
 def _cmd_build(a):
     import torch
 
@@ -202,6 +330,14 @@ def main(argv=None):
     s.add_argument("--max-context", type=int, default=20480)
     s.add_argument("--device-gib", type=float, default=71.5)
     s.set_defaults(fn=_cmd_plan)
+    s = sub.add_parser(
+        "preflight", help="host RAM / disk / GPU checks before the store"
+    )
+    s.add_argument("--offload-dir", required=True)
+    s.add_argument("--min-ram-gib", type=float, default=500.0)
+    s.add_argument("--min-disk-gib", type=float, default=300.0)
+    s.add_argument("--min-gpu-free-gib", type=float, default=62.0)
+    s.set_defaults(fn=_cmd_preflight)
     s = sub.add_parser("build-store", help="write the MoE-Infinity store")
     add_engine_args(s)
     s.set_defaults(fn=_cmd_build)

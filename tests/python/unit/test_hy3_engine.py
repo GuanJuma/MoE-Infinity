@@ -292,6 +292,35 @@ def test_server_roundtrip(ckpt_dir, tmp_path):
     assert len(list((tmp_path / "srv").glob("*.pt"))) == 2
 
 
+def test_preflight(tmp_path):
+    from moe_infinity.hy3.cli import preflight
+
+    proc, sysfs = tmp_path / "proc", tmp_path / "node"
+    (proc / "self").mkdir(parents=True)
+    (proc / "meminfo").write_text(f"MemAvailable:   {600 * 2**20} kB\n")
+    (proc / "self" / "status").write_text("Mems_allowed_list:\t0\n")
+    (sysfs / "node0").mkdir(parents=True)
+    (sysfs / "node0" / "meminfo").write_text(
+        f"Node 0 MemFree:   {300 * 2**20} kB\n"
+        f"Node 0 Inactive(file):  {100 * 2**20} kB\n"
+    )
+    ok, lines = preflight(
+        str(tmp_path / "store"),
+        min_ram_gib=500,
+        min_disk_gib=0,
+        min_gpu_free_gib=0,
+        proc=str(proc),
+        sysfs=str(sysfs),
+    )
+    assert not ok  # node 0 has only 400 GiB free + reclaimable
+    assert lines[0].startswith("OK") and "600 GiB" in lines[0]
+    assert lines[1].startswith("FAIL") and "node0 400" in lines[1]
+    ok, lines = preflight(
+        str(tmp_path / "store"), 350, 0, 0, proc=str(proc), sysfs=str(sysfs)
+    )
+    assert all(not ln.startswith("FAIL") for ln in lines[:3])
+
+
 def test_memory_plan(ckpt_dir):
     from moe_infinity.hy3.cli import memory_plan
 

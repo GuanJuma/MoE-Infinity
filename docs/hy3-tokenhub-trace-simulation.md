@@ -25,6 +25,27 @@ tokenhub jsonl ──► Hy3 on MoE-Infinity (1 GPU, experts in host memory)
 | `benchmarks/hy3_trace/sglang_dump_to_traces.py` | Fallback: split SGLang `per_token` expert-distribution dumps into the same trace files. |
 | `benchmarks/hy3_trace/tokenhub/` | tokenhub_bench hardware + job YAML for the MoE-Infinity server. |
 
+## First run (defaults)
+
+The defaults match the first server run: native store (`--store mi`), the
+1k bucket (`cache_1k_{hot,cold,mix50}`, 20 rows each, 32 output tokens like
+tokenhub's `cache_hit`), Belady/LRU/LFU over 4-128 GiB caches. tokenhub's
+`performance`/`capacity` suites stay skipped (`datasets/perf_zh` is not in
+the zip).
+
+```bash
+python -m moe_infinity.hy3 preflight --offload-dir $STORE   # RAM >= 500 GiB, disk >= 300 GiB, GPU free
+python -m moe_infinity.hy3 build-store --model-dir /model --offload-dir $STORE
+python -m moe_infinity.hy3 generate --model-dir /model --offload-dir $STORE
+python benchmarks/hy3_trace/run_tokenhub_traces.py --model-dir /model \
+    --offload-dir $STORE --tokenhub-dir $TH --out $OUT
+python benchmarks/hy3_trace/simulate_traces.py --traces $OUT/traces \
+    --sim-dir $SIM --out $OUT/sim
+```
+
+`--store pinned` (pure PyTorch, 267 GiB pinned, no offload files) is the
+fallback if the native store fails.
+
 ## Why a dedicated Hy3 path
 
 MoE-Infinity's generic `MoE()`/`OffloadEngine` path cannot serve Hy3-FP8:
