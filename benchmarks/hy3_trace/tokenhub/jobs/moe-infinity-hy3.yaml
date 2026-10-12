@@ -1,0 +1,11 @@
+# tokenhub_bench job: Hy3 model contract x MoE-Infinity Hy3 server x smoke profile.
+# Copy to <tokenhub_bench>/configs/jobs/ (with hardware/moe-infinity-hy3.yaml).
+# Traffic driver for trace collection: run -s cache_hit / -s performance --quick.
+
+name: moe-infinity-hy3-smoke
+model: hy3-channel
+hardware: moe-infinity-hy3
+profile: smoke
+
+official:
+  enabled: false
